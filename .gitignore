@@ -1,0 +1,38 @@
+# ── 密钥 / 私密配置 ──
+.env
+config.yaml
+
+# ── NapCat 外部依赖（运行时二进制 + QQ号配置） ──
+napcat_shell/
+napcat/
+
+# ── 调试数据 ──
+debug/
+
+# ── 运行时数据（含真实 QQ 号 + 对话记录） ──
+chat_memory.json
+proactive_friends.json
+profile_state.json
+user_facts.json
+qzone_feeds.json
+
+# ── 日志 ──
+*.log
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db

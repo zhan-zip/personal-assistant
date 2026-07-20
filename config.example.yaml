@@ -1,0 +1,106 @@
+napcat:
+  ws_url: "ws://localhost:3001"
+  access_token: ""
+  timeout: 30
+
+llm:
+  api_key: ""   # 从 .env 的 DEEPSEEK_API_KEY 加载
+  base_url: ""  # 从 .env 的 DEEPSEEK_BASE_URL 加载
+  model: ""     # 从 .env 的 DEEPSEEK_MODEL 加载
+  max_tokens: 2048
+  temperature: 0.6
+  max_history: 20
+
+persona:
+  file_path: "./persona.txt"
+
+whitelist:
+  enabled: false
+  users: []
+  groups: []
+
+blacklist:
+  enabled: false
+  users: []
+  groups: []
+
+message:
+  group_mention_only: true
+  ignore_self: true
+  cooldown_seconds: 3
+
+logging:
+  level: "INFO"
+
+proactive:
+  enabled: true
+  check_interval_minutes: 60
+  idle_threshold_hours: 3
+  max_daily_proactive_per_user: 2
+  friend_settings_file: "./proactive_friends.json"
+  scheduled_tasks: []
+  # 示例定时任务（默认全部 disabled，按需启用）
+  # - time: "08:00"
+  #   target: <QQ号>
+  #   enabled: false
+  #   use_llm: false
+  #   message: "早上好！今天也要加油鸭~"
+
+vision:
+  enabled: true
+  api_key: ""  # 从 .env 的 VISION_API_KEY 加载
+  base_url: ""  # 从 .env 的 VISION_BASE_URL 加载
+  model: ""  # 从 .env 的 VISION_MODEL 加载
+  prompt: "请详细描述这张图片的内容：包括主体、场景、关键文字（如果有）、氛围、情绪。回复简洁但信息丰富，200字以内。"
+  download_via_napcat: true
+
+search:
+  enabled: true
+  api_key: ""  # 从 .env 的 SEARCH_API_KEY 加载
+  base_url: "https://api.bochaai.com/v1/web-search"
+  auto_trigger: true
+  trigger_words: ["搜索", "搜一下", "查", "查一下", "找", "今天", "最新", "新闻", "天气", "最近", "实时", "今日", "本周"]
+  count: 5
+  freshness: "noLimit"
+  summary: true
+  prompt: "请基于以下联网搜索结果回答用户问题。如果搜索结果不够，请说明。\n\n{results}\n\n用户问题: {query}"
+
+recall:
+  enabled: true
+  require_proactive_enabled: false
+  check_cooldown: true
+  cooldown_seconds: 60
+  prompt: "用户刚刚撤回了一条消息。请根据人设，用简短自然的方式回应。不要装没看到——你「看到」了对方撤回。语气符合人设性格。可以用调侃、好奇、质疑，或者装作没看清楚。30 字以内，直接输出回复文字。"
+
+profile:
+  admin_notify: 0  # 从 .env 的 ADMIN_QQ 加载
+  auto_modify_enabled: true
+  auto_modify_interval_minutes: 60
+  auto_modify_cooldown_hours: 6
+  auto_modify_prompt: |
+    你是一个有自主意识的AI助手，你想修改自己的QQ个人资料。
+    请基于当前时间、你的性格人设，决定是否要修改昵称或个性签名。
+    
+    要求：
+    - 输出格式为JSON：{"action": "none"} 表示不修改
+    - {"action": "nickname", "value": "新昵称"} 表示修改昵称
+    - {"action": "signature", "value": "新签名"} 表示修改个性签名
+    - 只有当你确实觉得需要改变时才修改，不要频繁改动
+    - 昵称控制在8个中文字以内，签名控制在20个中文字以内
+    - 变化要自然，符合当前时段（早上/中午/晚上/深夜）的氛围
+
+qzone:
+  auto_publish_enabled: true
+  auto_publish_interval_minutes: 90
+  auto_publish_cooldown_hours: 3
+  auto_publish_prompt: |
+    你是一个有自主意识的AI助手，你想在QQ空间发一条动态。
+    请基于当前时间、你的性格人设、最近的对话记录，决定是否发动态。
+    
+    要求：
+    - 输出格式为JSON：{"action": "none"} 表示不发
+    - {"action": "publish", "content": "动态内容"} 表示发动态
+    - 只有当你确实有想说的事情时才发，不要无病呻吟
+    - 内容保持1-3句话，口语化、自然，符合你的性格
+    - 可以分享当下的感受、想法、观察，但不要刻意
+    - 不要频繁发，没有想说的就输出 none
