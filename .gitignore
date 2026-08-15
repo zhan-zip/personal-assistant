@@ -19,6 +19,9 @@ memory.db
 memory.db-shm
 memory.db-wal
 
+# ── 沙箱工作目录 (文件工具写入的用户笔记/数据) ──
+workspace/
+
 # ── 日志 ──
 *.log
 
