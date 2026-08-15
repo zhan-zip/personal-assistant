@@ -18,6 +18,15 @@ from profile.profile import ProfileManager
 from protocols.base import Message
 
 
+class MockStore:
+    """假存储层: 测试逻辑用, 不碰真实 SQLite"""
+    async def add_message(self, *a, **k):
+        pass
+
+    async def clear_history(self, *a, **k):
+        pass
+
+
 def _new_bot():
     b = bot_module.QQBot.__new__(bot_module.QQBot)
     b.config = {
@@ -62,6 +71,7 @@ def _new_bot():
     b.progress = ProgressReporter(b)
     b.message_processor = MessageProcessor(b)
     b.event_handler = EventHandler(b)
+    b.memory_store = MockStore()   # 假存储, 不落盘
 
     sent = []
 

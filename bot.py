@@ -27,6 +27,7 @@ from llm.llm import LLMClient
 from core.message_processor import MessageProcessor
 from core.event_handler import EventHandler
 from core.utils import now_iso, format_time
+from core.memory_store import get_store
 
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
@@ -83,8 +84,9 @@ class QQBot:
         self.running = False
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._bg_tasks: List[asyncio.Task] = []  # 后台任务引用, 重连时取消
-        self.chat_memory: Dict = self._load_chat_memory()
+        self.chat_memory: Dict = {}   # 内存缓存, 启动时从 SQLite 载入
         self.proactive_cache: Dict = self._load_proactive()
+        self.memory_store = get_store()   # SQLite 记忆存储层
 
         # 人设缓存
         self.persona_cache: Optional[str] = None
@@ -333,15 +335,56 @@ class QQBot:
         max_history = self.config["llm"]["max_history"]
         if len(self.chat_memory[key]) > max_history:
             self.chat_memory[key] = self.chat_memory[key][-max_history:]
-        self._save_chat_memory()
+        # 异步落盘 SQLite (不阻塞事件循环)
+        try:
+            asyncio.create_task(self.memory_store.add_message(
+                key, msg["role"], msg["content"], msg["timestamp"],
+                msg.get("message_id"),
+            ))
+        except Exception as e:
+            logger.warning(f"[MEM] 落盘失败: {e}")
 
     def _clear_history(self, user_id: int, group_id: Optional[int] = None) -> bool:
         key = self._get_cache_key(user_id, group_id)
         if key in self.chat_memory:
             self.chat_memory[key] = []
-            self._save_chat_memory()
+            try:
+                asyncio.create_task(self.memory_store.clear_history(key))
+            except Exception as e:
+                logger.warning(f"[MEM] 清空落盘失败: {e}")
             return True
         return False
+
+    async def _init_memory(self):
+        """启动时从 SQLite 载入记忆到内存缓存; SQLite 为空时从旧 JSON 迁移"""
+        store = self.memory_store
+        await store.init()
+        if await store.is_empty():
+            legacy_mem = {}
+            if os.path.exists(CHAT_MEMORY_FILE):
+                try:
+                    with open(CHAT_MEMORY_FILE, "r", encoding="utf-8") as f:
+                        legacy_mem = json.load(f)
+                except Exception:
+                    legacy_mem = {}
+            legacy_facts = {}
+            facts_file = "user_facts.json"
+            if os.path.exists(facts_file):
+                try:
+                    with open(facts_file, "r", encoding="utf-8") as f:
+                        legacy_facts = json.load(f)
+                except Exception:
+                    legacy_facts = {}
+            if legacy_mem or legacy_facts:
+                await store.migrate_from_json(legacy_mem, legacy_facts)
+        self.chat_memory = await store.load_all_messages()
+        # 长期记忆注入 long_memory 内存缓存
+        try:
+            self.long_memory.set_store(store)
+            self.long_memory._cache = await store.load_all_facts()
+        except Exception as e:
+            logger.warning(f"[MEM] 长期记忆加载失败: {e}")
+        logger.info(f"[MEM] 记忆已加载: {len(self.chat_memory)} 个会话")
 
     # ==================== 资料初始化 (启动时调用一次) ====================
 
@@ -726,6 +769,7 @@ class QQBot:
 
     async def run(self):
         """主循环: 并发连接所有 adapter, 各自断线自动重连"""
+        await self._init_memory()   # 从 SQLite 载入记忆 / 迁移旧 JSON
         tasks = [
             asyncio.create_task(self._adapter_loop(name, adp))
             for name, adp in self.adapters.items()
@@ -794,6 +838,10 @@ class QQBot:
                 pass
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
+        try:
+            await self.memory_store.close()
+        except Exception:
+            pass
 
     async def _start_background_tasks(self):
         if self.config.get("proactive", {}).get("enabled"):

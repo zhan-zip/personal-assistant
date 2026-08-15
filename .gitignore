@@ -15,6 +15,9 @@ proactive_friends.json
 profile_state.json
 user_facts.json
 qzone_feeds.json
+memory.db
+memory.db-shm
+memory.db-wal
 
 # ── 日志 ──
 *.log

@@ -1,9 +1,10 @@
 """
 长期记忆模块:
 - 每个用户一份 facts (性格, 偏好, 关系, 重要事件...)
-- 永久存盘 user_facts.json
+- 持久化到 SQLite facts 表 (core.memory_store), 内存缓存 + 异步落盘
 - 每次对话时把 facts 拼到 system prompt 里
 """
+import asyncio
 import json
 import logging
 import re
@@ -40,28 +41,27 @@ _EXTRACT_PROMPT = """从下面这段对话里提取关于用户(说话者)的关
 
 
 class LongMemory:
-    """per-user 长期记忆管理"""
+    """per-user 长期记忆管理 (内存缓存 + SQLite 异步落盘)"""
 
-    def __init__(self, file_path: Path = USER_FACTS_FILE):
+    def __init__(self, file_path: Path = USER_FACTS_FILE, store=None):
         self.file_path = file_path
-        self._cache: Dict[str, Dict] = {}
-        self._load()
+        self._store = store
+        self._cache: Dict[str, Dict] = {}   # 由 bot 启动时从 SQLite 注入
 
-    def _load(self):
-        if self.file_path.exists():
-            try:
-                self._cache = json.loads(self.file_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                logger.warning(f"加载 {self.file_path} 失败: {e}")
-                self._cache = {}
-        else:
-            self._cache = {}
+    def set_store(self, store):
+        self._store = store
 
-    def _save(self):
-        self.file_path.write_text(
-            json.dumps(self._cache, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    def _persist(self, user_id: str):
+        """异步落盘该用户事实到 SQLite"""
+        if not self._store:
+            return
+        try:
+            info = self._cache.get(user_id, {})
+            asyncio.create_task(self._store.save_facts(
+                user_id, info.get("facts", []), info.get("updated_at", "")
+            ))
+        except Exception as e:
+            logger.warning(f"长期记忆落盘失败: {e}")
 
     def get_facts(self, user_id: int) -> List[str]:
         """取某用户的 facts 列表"""
@@ -98,13 +98,17 @@ class LongMemory:
             info["facts"].append(f)
             existing.add(f)
         info["updated_at"] = now_iso()
-        self._save()
+        self._persist(key)
 
     def clear(self, user_id: int):
         key = str(user_id)
         if key in self._cache:
             del self._cache[key]
-            self._save()
+            if self._store:
+                try:
+                    asyncio.create_task(self._store.clear_facts(key))
+                except Exception as e:
+                    logger.warning(f"长期记忆清空落盘失败: {e}")
 
     async def extract_and_store(self, user_id: int, transcript: str, llm_client) -> int:
         """调用 LLM 从一段对话中抽取 facts, 存盘
