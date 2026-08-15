@@ -814,12 +814,27 @@ class QQBot:
         try:
             from mcp_integration.client import create_food_time_client
             from llm.tools import TOOLS
-            client = create_food_time_client()
+            client = create_food_time_client(
+                server_dir=self.config.get("mcp", {}).get("food_time_server_dir") or None
+            )
             tool_defs = await client.connect()
             if tool_defs:
                 self.mcp_clients["food_time"] = client
-                TOOLS.extend(tool_defs)
-                logger.info(f"[MCP-client] Food-Time {len(tool_defs)} 个工具已并入 tool-calling")
+                # 幂等并入: 已有同名工具不重复追加 (避免重复调用/热重启导致工具累积)
+                existing_names = {
+                    t["function"]["name"] for t in TOOLS
+                    if isinstance(t, dict) and t.get("function")
+                }
+                new_defs = [
+                    d for d in tool_defs
+                    if d.get("function", {}).get("name") not in existing_names
+                ]
+                if new_defs:
+                    TOOLS.extend(new_defs)
+                logger.info(
+                    f"[MCP-client] Food-Time {len(tool_defs)} 个工具已并入 tool-calling"
+                    f" (新增 {len(new_defs)})"
+                )
             else:
                 await client.close()
         except Exception as e:
@@ -900,10 +915,15 @@ class QQBot:
     async def _start_background_tasks(self):
         if self.config.get("proactive", {}).get("enabled"):
             logger.info(
-                f"主动消息已启用, 检查间隔: "
+                f"主动消息开启, 频率: "
                 f"{self.config['proactive'].get('check_interval_minutes', 10)}分钟"
             )
             self._bg_tasks.append(asyncio.create_task(self.proactive_manager.proactive_loop()))
+            # 定时任务 (scheduled_tasks, 有配置才启动)
+            if self.config.get("proactive", {}).get("scheduled_tasks"):
+                self._bg_tasks.append(
+                    asyncio.create_task(self.proactive_manager.scheduled_tasks_loop())
+                )
 
         if self.config.get("profile", {}).get("auto_modify_enabled"):
             logger.info(

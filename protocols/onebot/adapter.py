@@ -65,7 +65,10 @@ class OneBotAdapter(BaseAdapter):
     async def connect(self, on_event=None, on_message=None, on_ready=None) -> bool:
         self._event_callback = on_event
         self._message_callback = on_message
-        async with websockets.connect(self.ws_url) as ws:
+        async with websockets.connect(
+            self.ws_url,
+            extra_headers={"Authorization": f"Bearer {self.access_token}"} if self.access_token else None,
+        ) as ws:
             self.websocket = ws
             logger.info("NapCat 连接成功")
             if on_ready:

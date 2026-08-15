@@ -6,6 +6,7 @@
 """
 import asyncio
 import logging
+import os
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -14,13 +15,18 @@ from mcp import ClientSession, StdioServerParameters, stdio_client
 logger = logging.getLogger("mcp.client")
 
 # Food-Time MCP server 位置 (在 server/ 目录启动, 以便读到它的 .env 连 MySQL)
-FOOD_TIME_SERVER_DIR = r"D:\Desktop\test\TreaWork\Food-Time\server"
+# 可配置: 环境变量 FOOD_TIME_SERVER_DIR > 构造参数 server_dir > 本机默认路径
+DEFAULT_FOOD_TIME_SERVER_DIR = r"D:\Desktop\test\TreaWork\Food-Time\server"
+FOOD_TIME_SERVER_DIR = os.environ.get(
+    "FOOD_TIME_SERVER_DIR", DEFAULT_FOOD_TIME_SERVER_DIR
+)
 
 
 class FoodTimeClient:
     """连接 Food-Time MCP server 的客户端"""
 
-    def __init__(self):
+    def __init__(self, server_dir: Optional[str] = None):
+        self.server_dir = server_dir or FOOD_TIME_SERVER_DIR
         self.session: Optional[ClientSession] = None
         self._ctx = None
         self.tool_names: set = set()
@@ -31,7 +37,7 @@ class FoodTimeClient:
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "src.mcp_integration.server"],
-            cwd=FOOD_TIME_SERVER_DIR,
+            cwd=self.server_dir,
         )
         self._ctx = stdio_client(params)
         read, write = await self._ctx.__aenter__()
@@ -72,6 +78,6 @@ class FoodTimeClient:
         self._ctx = None
 
 
-def create_food_time_client() -> FoodTimeClient:
-    """工厂: 创建 Food-Time MCP client"""
-    return FoodTimeClient()
+def create_food_time_client(server_dir: Optional[str] = None) -> FoodTimeClient:
+    """工厂: 创建 Food-Time MCP client (server_dir 为空则用环境变量/默认路径)"""
+    return FoodTimeClient(server_dir=server_dir)

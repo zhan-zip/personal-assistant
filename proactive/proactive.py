@@ -198,6 +198,65 @@ class ProactiveManager:
             except Exception as e:
                 logger.error(f"主动消息循环异常: {e}")
 
+    # ── 定时任务 (scheduled_tasks) ──────────────────
+    async def scheduled_tasks_loop(self):
+        """定时任务: 按 config.proactive.scheduled_tasks 每日定点发送
+        每 30 秒检查一次 HH:MM 匹配, 同一天同一任务只触发一次"""
+        bot = self.bot
+        tasks = bot.config.get("proactive", {}).get("scheduled_tasks", []) or []
+        if not tasks:
+            return
+        fired: set = set()  # "日期|索引", 防同一天重复触发
+        while bot.running:
+            await asyncio.sleep(30)
+            if not bot.running:
+                break
+            try:
+                now = datetime.now(BEIJING_TZ)
+                today = now.strftime("%Y-%m-%d")
+                hhmm = now.strftime("%H:%M")
+                for idx, t in enumerate(tasks):
+                    if not t.get("enabled"):
+                        continue
+                    if str(t.get("time", "")) != hhmm:
+                        continue
+                    key = f"{today}|{idx}"
+                    if key in fired:
+                        continue
+                    fired.add(key)
+                    target = int(t.get("target", 0))
+                    if not target:
+                        logger.warning(f"[定时任务] 任务#{idx} 缺少 target, 跳过")
+                        continue
+                    message = (t.get("message") or "").strip()
+                    if t.get("use_llm"):
+                        message = await self._llm_scheduled_message(t, message)
+                    if not message:
+                        continue
+                    logger.info(f"[定时任务] -> {target}: {message[:40]}")
+                    await bot.send_text("onebot", target, None, message)
+                    bot._add_message(target, "assistant", message)
+            except Exception as e:
+                logger.error(f"定时任务循环异常: {e}")
+
+    async def _llm_scheduled_message(self, task: dict, hint: str) -> str:
+        """use_llm=true 时用 LLM 按场景生成问候/提醒语"""
+        try:
+            persona = self.bot._get_persona()
+            prompt = (
+                f"现在需要你根据人设给用户发一条问候/提醒消息。\n"
+                f"人设: {persona}\n"
+                f"场景提示: {hint or '自然的日常问候'}\n"
+                "直接输出消息内容, 不要任何解释, 50字以内。"
+            )
+            return (await self.bot.llm.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.8, max_tokens=100,
+            ) or "").strip()
+        except Exception as e:
+            logger.warning(f"[定时任务] LLM 生成失败: {e}")
+            return hint or ""
+
     # ── 自主修改资料 ────────────────────────────────
     async def auto_modify_profile_loop(self):
         bot = self.bot

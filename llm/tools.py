@@ -850,8 +850,7 @@ async def execute_tool(bot: "QQBot", tool_name: str,
                 if tool_name in _client.tool_names:
                     return await _client.call(tool_name, arguments)
 
-        else:
-            return f"[错误] 未知工具: {tool_name}"
+        return f"[错误] 未知工具: {tool_name}"
 
     except Exception as e:
         logger.error(f"工具执行失败 [{tool_name}]: {e}")
