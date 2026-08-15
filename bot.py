@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from protocols.onebot import OneBotAdapter
+from protocols.web import WebAdapter
 from qzone.qzone_browser import QZoneBrowser, _extract_f_info_text
 from core.commands import CommandHandler
 from proactive.proactive import ProactiveManager
@@ -84,20 +85,31 @@ class QQBot:
         self.persona_cache: Optional[str] = None
         self.persona_mtime: float = 0.0
 
-        # 协议适配器（当前: OneBot / NapCat）—— 协议细节收口在此
+        # 协议适配器列表 (支持多协议并发) —— 协议细节收口在各 adapter
+        self.adapters: Dict[str, Any] = {}
         ncfg = self.config.get("napcat", {})
-        self.adapter = OneBotAdapter(
+        self.adapters["onebot"] = OneBotAdapter(
             self,
             ws_url=ncfg.get("ws_url", "ws://localhost:3001"),
             access_token=ncfg.get("access_token", ""),
             timeout=ncfg.get("timeout", 30),
         )
+        wcfg = self.config.get("web", {})
+        if wcfg.get("enabled", True):
+            self.adapters["web"] = WebAdapter(
+                self,
+                host=wcfg.get("host", "127.0.0.1"),
+                port=wcfg.get("port", 8080),
+            )
+        # 兼容引用: 默认 adapter 指向 onebot
+        self.adapter = self.adapters["onebot"]
         self._retry_count = 0
+        self._bg_started = False
 
         # 撤回相关
-        self.message_id_buffer: Dict[int, str] = {}
+        self.message_id_buffer: Dict[str, Any] = {}
         # message_id → 接收时间 (用于周期性撤回扫描: 只检查最近 N 分钟内收到的)
-        self.message_recv_time: Dict[int, float] = {}
+        self.message_recv_time: Dict[str, float] = {}
         # 本轮已确认触发的撤回 message_id 集合, 用于防 LLM 幻觉:
         # handle_recall 把 message_id 加进来, message_processor 检查 LLM 输出
         # 是否含"你撤回了"但当前 message_id 不在集合里 → 视为幻觉, 过滤
@@ -351,6 +363,17 @@ class QQBot:
 
     async def _send_group_msg(self, group_id: int, message: str):
         return await self.adapter.send_group(group_id, message)
+
+    async def send_text(self, channel: str, user_id, group_id,
+                        message: str) -> Optional[int]:
+        """按 channel 路由发送 (核心跨协议发送入口)"""
+        adapter = self.adapters.get(channel)
+        if adapter is None:
+            logger.warning(f"[SEND] 未知 channel: {channel}, 消息丢弃: {message[:30]}")
+            return None
+        if group_id:
+            return await adapter.send_group(group_id, message)
+        return await adapter.send_private(user_id, message)
 
     # ==================== LLM / 服务封装 ====================
 
@@ -674,57 +697,73 @@ class QQBot:
             if not task.done():
                 task.cancel()
         self._bg_tasks.clear()
+        self._bg_started = False
 
         self.message_id_buffer.clear()
         self.message_recv_time.clear()
         self._verified_recall_ids.clear()
 
     async def run(self):
-        """主循环: 连接 NapCat, 断线自动重连"""
-        max_backoff = 60  # 最大重试间隔（秒）
+        """主循环: 并发连接所有 adapter, 各自断线自动重连"""
+        tasks = [
+            asyncio.create_task(self._adapter_loop(name, adp))
+            for name, adp in self.adapters.items()
+        ]
+        await asyncio.gather(*tasks)
 
+    async def _adapter_loop(self, name: str, adp):
+        """单个 adapter 的连接 + 自动重连循环"""
+        max_backoff = 60  # 最大重试间隔（秒）
         while True:
             try:
                 self._reset_connection_state()
-                self.adapter.reset_state()
-                label = (f"重连 NapCat (第{self._retry_count}次): {self.adapter.ws_url}"
-                         if self._retry_count else f"连接 NapCat: {self.adapter.ws_url}")
+                if hasattr(adp, "reset_state"):
+                    adp.reset_state()
+                label = (f"重连 {name} (第{self._retry_count}次)"
+                         if self._retry_count else f"连接 {name}")
                 logger.info(label)
-
-                await self.adapter.connect(
+                await adp.connect(
                     on_event=self._on_adapter_event,
+                    on_message=self._on_message,
                     on_ready=self._on_adapter_ready,
                 )
             except Exception as e:
-                logger.error(f"WebSocket 连接断开: {e}")
+                logger.error(f"[{name}] 连接断开: {e}")
             finally:
                 self.running = False
 
             self._retry_count += 1
             delay = min(max_backoff, 2 ** self._retry_count)
-            logger.info(f"{delay} 秒后自动重连...")
+            logger.info(f"[{name}] {delay} 秒后自动重连...")
             await asyncio.sleep(delay)
 
     async def _on_adapter_ready(self):
-        """连接建立后、开始监听前，初始化核心状态"""
+        """连接建立后、开始监听前，初始化核心状态（只做一次）"""
         self.running = True
         self._retry_count = 0
-        logger.info("NapCat 连接成功")
+        if self._bg_started:
+            return
+        self._bg_started = True
+        logger.info("连接成功, 初始化核心...")
         await self._init_profile_cache()
         # 后台生成进度消息池 (不阻塞主流程)
         asyncio.create_task(self.progress.init_pool())
         await self._start_background_tasks()
 
+    async def _on_message(self, message):
+        """Adapter 收到统一 Message → 交给事件处理器"""
+        asyncio.create_task(self.event_handler.handle_message(message))
+
     async def _on_adapter_event(self, event: Dict):
-        """Adapter 收到原始事件时回调，交给事件处理器"""
+        """Adapter 收到非消息事件（撤回通知/心跳等）→ 交给事件处理器"""
         asyncio.create_task(self.event_handler.handle_event(event))
 
     async def _shutdown(self):
-        """最终清理: 关闭适配器 / 浏览器 / HTTP 会话"""
+        """最终清理: 关闭所有适配器 / 浏览器 / HTTP 会话"""
         self.running = False
-        if getattr(self, "adapter", None):
+        for adp in self.adapters.values():
             try:
-                await self.adapter.close()
+                await adp.close()
             except Exception:
                 pass
         if self.qzone_browser:
@@ -790,7 +829,7 @@ class QQBot:
                         continue
                     try:
                         result = await self._send_ws_request(
-                            "get_msg", {"message_id": mid}, timeout=5
+                            "get_msg", {"message_id": int(mid)}, timeout=5
                         )
                     except Exception as e:
                         logger.debug(f"[撤回扫描] get_msg {mid} 异常: {e}")

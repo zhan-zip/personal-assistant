@@ -3,6 +3,11 @@ napcat:
   access_token: ""
   timeout: 30
 
+web:
+  enabled: true          # 自制网页聊天界面（浏览器访问 http://127.0.0.1:8080）
+  host: "127.0.0.1"
+  port: 8080
+
 llm:
   api_key: ""   # 从 .env 的 DEEPSEEK_API_KEY 加载
   base_url: ""  # 从 .env 的 DEEPSEEK_BASE_URL 加载

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Set
 
 if TYPE_CHECKING:
     from bot import QQBot
+    from protocols.base import Message
 
 logger = logging.getLogger("event_handler")
 
@@ -31,7 +32,7 @@ class EventHandler:
     def __init__(self, bot: "QQBot"):
         self.bot = bot
         # 严格按 message_id 去重
-        self._processed_message_ids: Set[int] = set()
+        self._processed_message_ids: Set[str] = set()
         # 内容+用户哈希 → 时间戳
         self._recent_msg_hashes: Dict[str, float] = {}
 
@@ -48,8 +49,8 @@ class EventHandler:
         self.filtered_by_other: int = 0
 
     # ── 消息去重 (双层: message_id + 内容哈希) ─────
-    def is_duplicate(self, user_id: int, message: str,
-                     message_id: Optional[int]) -> bool:
+    def is_duplicate(self, user_id, message: str,
+                     message_id: Optional[str]) -> bool:
         """返回 True 表示消息是重复的, 应被丢弃
 
         第一层: message_id (同一 message_id 绝对只处理一次)
@@ -122,7 +123,7 @@ class EventHandler:
         self._seen_content[ch] = self._seen_content.get(ch, 0) + 1
 
     # ── 撤回检测 ──────────────────────────────────
-    async def check_recall_via_get_msg(self, msg_id: int, user_id: int):
+    async def check_recall_via_get_msg(self, msg_id, user_id):
         """6秒后用 get_msg 反查消息是否被撤回, 是对 notice 路径的兜底
 
         关键: get_msg 拿不到 raw_message 可能是 "撤回" 也可能是 "NapCat 缓存过期/GC"
@@ -131,9 +132,10 @@ class EventHandler:
           2) message_id_buffer 里还有这条消息的原文 (说明之前收到过)
         """
         await asyncio.sleep(6)
+        msg_key = str(msg_id)
         # 第一道证据: get_msg 拿到 raw_message 没?
         data = await self.bot._send_ws_request(
-            "get_msg", {"message_id": msg_id}, timeout=5
+            "get_msg", {"message_id": int(msg_id)}, timeout=5
         )
         raw = ""
         if data and isinstance(data, dict):
@@ -146,30 +148,30 @@ class EventHandler:
                 )
         if raw:
             # 消息还在, 不算撤回
-            if msg_id in self.bot.message_id_buffer:
-                self.bot.message_id_buffer[msg_id] = raw
+            if msg_key in self.bot.message_id_buffer:
+                self.bot.message_id_buffer[msg_key] = raw
             return
 
         # 第二道证据: message_id_buffer 里得有原文, 否则可能是:
         #   (a) buffer 已被 LRU 淘汰 (超过 100 条后)
         #   (b) bot 启动后第一次收到消息前用户已撤回
         # 这两种情况都不响应, 但记日志方便排查
-        original = self.bot.message_id_buffer.get(msg_id, "")
+        original = self.bot.message_id_buffer.get(msg_key, "")
         if not original or original.startswith("("):
             logger.info(
-                f"[get_msg反查] msg_id={msg_id} get_msg 无内容, "
+                f"[get_msg反查] msg_id={msg_key} get_msg 无内容, "
                 f"buffer 也无原文 (size={len(self.bot.message_id_buffer)}), 跳过"
             )
             return
 
         # 双重证据齐全 → 真正撤回
         logger.info(
-            f"[get_msg反查] 消息 {msg_id} 已撤回, "
+            f"[get_msg反查] 消息 {msg_key} 已撤回, "
             f"buffer原内容: {original[:30]!r}"
         )
         # 用过即丢, 避免重复响应
-        self.bot.message_id_buffer.pop(msg_id, None)
-        await self.handle_recall(user_id, msg_id, original)
+        self.bot.message_id_buffer.pop(msg_key, None)
+        await self.handle_recall(user_id, msg_key, original)
 
     async def handle_recall_notice(self, event: Dict):
         """处理 friend_recall / group_recall 通知事件
@@ -191,12 +193,12 @@ class EventHandler:
             )
             return
 
-        original = self.bot.message_id_buffer.pop(msg_id, "(撤回太快, 没记录到)")
+        original = self.bot.message_id_buffer.pop(str(msg_id), "(撤回太快, 没记录到)")
         logger.info(
             f"[NOTICE] {notice_type} user={user_id} msg_id={msg_id} "
             f"原内容: {original[:30]!r}"
         )
-        await self.handle_recall(user_id, msg_id, original)
+        await self.handle_recall(user_id, str(msg_id), original)
 
     async def handle_recall(self, user_id: int, msg_id: int, content: str,
                             bypass_cooldown: bool = False):
@@ -372,68 +374,75 @@ class EventHandler:
             "double_pushed_content_hashes": double_contents,
         }
 
-    # ── 主入口: 分发 event ─────────────────────────
+    # ── 主入口: 处理聊天消息 (统一 Message) ───────
+    async def handle_message(self, message: "Message"):
+        """收到一条统一 Message（QQ/网页等任何协议）"""
+        user_id = message.user_id
+        group_id = message.group_id
+        message_id = message.message_id
+        text = message.text
+
+        # 保底: 忽略自己发的
+        if (self.bot.config["message"].get("ignore_self", True)
+                and str(user_id) == str(self.bot.config.get("self_id"))):
+            self.filtered_by_other += 1
+            return
+
+        # 白/黑名单
+        if not self.bot._is_whitelisted(user_id, group_id):
+            self.filtered_by_other += 1
+            return
+        if self.bot._is_blacklisted(user_id, group_id):
+            self.filtered_by_other += 1
+            return
+
+        if not text and not message.images:
+            self.filtered_by_other += 1
+            return
+
+        # 去重
+        if self.is_duplicate(user_id, text or message.raw.get("raw_message", ""), message_id):
+            return
+
+        # 注册新好友 (仅 OneBot 私聊; 网页无"好友"概念)
+        if message.channel == "onebot" and not group_id:
+            try:
+                self.bot._register_proactive_user(int(user_id), group_id)
+            except (ValueError, TypeError):
+                pass
+
+        # 记录 self_id (OneBot)
+        sid = message.raw.get("self_id")
+        if sid and not self.bot.config.get("self_id"):
+            self.bot.config["self_id"] = sid
+            logger.info(f"已记录 self_id: {sid}")
+
+        # 私聊撤回兜底检测 (仅 OneBot 私聊)
+        if message.channel == "onebot" and message_id and not group_id:
+            try:
+                asyncio.create_task(
+                    self.check_recall_via_get_msg(int(message_id), int(user_id))
+                )
+            except (ValueError, TypeError):
+                pass
+
+        # 投递到主流程
+        asyncio.create_task(self.bot.message_processor.process(message))
+
+    # ── 主入口: 处理非消息事件 (notice/meta) ───────
     async def handle_event(self, event: Dict):
+        """处理非消息事件（撤回通知、心跳等）。消息事件已在 Adapter 层转成 Message。"""
         post_type = event.get("post_type")
 
-        # 1. 接收层诊断 (排查重复)
-        self._record_event_for_diag(event)
-
-        # 2. 自己发的消息直接忽略
+        # 自己发的消息直接忽略 (保底)
         if post_type == "message_sent":
             return
 
         if post_type == "message":
-            # 基础过滤: 忽略自己
-            if (self.bot.config["message"]["ignore_self"]
-                    and event.get("sender", {}).get("user_id")
-                    == self.bot.config.get("self_id")):
-                self.filtered_by_other += 1
-                return
+            # 理论不会走到这里 (Adapter 已转 Message); 保底走统一处理
+            return
 
-            user_id = event.get("user_id")
-            group_id = event.get("group_id")
-            message_id = event.get("message_id")
-            raw_message = event.get("raw_message", "")
-
-            # 白/黑名单
-            if not self.bot._is_whitelisted(user_id, group_id):
-                self.filtered_by_other += 1
-                return
-            if self.bot._is_blacklisted(user_id, group_id):
-                self.filtered_by_other += 1
-                return
-
-            # 解析
-            message, has_image, _, _ = self.bot.message_processor.parse_event(event)
-            if not message and not has_image:
-                self.filtered_by_other += 1
-                return
-
-            # 去重
-            if self.is_duplicate(user_id, message or raw_message, message_id):
-                return
-
-            # 注册新好友 (有缓存后只触发一次)
-            self.bot._register_proactive_user(user_id, group_id)
-
-            # 记录 self_id
-            sid = event.get("self_id")
-            if sid and not self.bot.config.get("self_id"):
-                self.bot.config["self_id"] = sid
-                logger.info(f"已记录 self_id: {sid}")
-
-            # 私聊撤回检测: 6秒后用 get_msg 反查, 双重证据才判定撤回
-            # (1) get_msg 拿不到 raw_message
-            # (2) message_id_buffer 里有原文
-            # 触发后调 LLM 决定是否要主动发消息询问, 而不是直接 send "你撤回了"
-            if message_id and group_id is None:
-                asyncio.create_task(self.check_recall_via_get_msg(message_id, user_id))
-
-            # 投递到主流程
-            asyncio.create_task(self.bot.message_processor.process(event))
-
-        elif post_type == "meta_event":
+        if post_type == "meta_event":
             meta_event_type = event.get("meta_event_type")
             if meta_event_type == "lifecycle":
                 logger.info(f"生命周期事件: {event.get('sub_type')}")

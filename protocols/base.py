@@ -20,8 +20,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 logger = logging.getLogger("protocols")
 
-# 事件回调：Adapter 收到一条"原始事件"时调用（暂用于向核心转发，逐步改为 Message）
+# 事件回调：Adapter 收到"非消息事件"（撤回通知/心跳等）时调用
 EventCallback = Callable[[Dict[str, Any]], Awaitable[None]]
+# 消息回调：Adapter 收到"聊天消息"（已转成统一 Message）时调用
+MessageCallback = Callable[["Message"], Awaitable[None]]
 
 
 @dataclass
@@ -34,7 +36,8 @@ class Message:
     group_id: Optional[str] = None          # 群聊 ID（私聊为 None）
     text: str = ""                          # 文本内容
     images: List[Dict] = field(default_factory=list)   # 图片段列表
-    reply_to: Optional[str] = None          # 被回复消息的引用
+    reply_to: Optional[str] = None          # 被回复消息的引用（message_id）
+    message_id: Optional[str] = None        # 协议侧消息编号（去重/撤回检测用）
     raw: Dict[str, Any] = field(default_factory=dict)  # 原始事件（备用）
 
     @staticmethod
@@ -60,14 +63,17 @@ class BaseAdapter(ABC):
     def __init__(self, bot: Any):
         self.bot = bot
         self._event_callback: Optional[EventCallback] = None
+        self._message_callback: Optional[MessageCallback] = None
 
     # ── 生命周期 ──
     @abstractmethod
     async def connect(self, on_event: Optional[EventCallback] = None,
+                      on_message: Optional[MessageCallback] = None,
                       on_ready: Optional[Callable[[], Awaitable[None]]] = None) -> bool:
         """建立连接并开始监听。
 
-        on_event: 收到原始事件时回调（当前传事件 dict）。
+        on_event: 非消息事件回调（撤回通知/心跳等，传原始事件 dict）。
+        on_message: 聊天消息回调（传统一 Message）。
         on_ready: 连接建立后、开始监听前调用（用于核心初始化）。
         阻塞直到断线。返回是否正常退出。
         """

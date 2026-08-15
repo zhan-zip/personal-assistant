@@ -16,6 +16,7 @@ from llm.tools import TOOLS, TOOLS_README, execute_tool
 
 if TYPE_CHECKING:
     from bot import QQBot
+    from protocols.base import Message
 
 logger = logging.getLogger("message_processor")
 
@@ -39,36 +40,8 @@ class MessageProcessor:
     def __init__(self, bot: "QQBot"):
         self.bot = bot
 
-    # ── 解析 ──────────────────────────────────────
-    @staticmethod
-    def parse_event(event: Dict) -> Tuple[str, bool, List[Dict], Optional[Dict]]:
-        """从 event 中解析出 (文本/是否有图/图片段/回复引用)"""
-        message_raw = event.get("message", "")
-        message = ""
-        has_image = False
-        image_segments: List[Dict] = []
-        reply_segment: Optional[Dict] = None
-
-        if isinstance(message_raw, list):
-            for seg in message_raw:
-                seg_type = seg.get("type")
-                if seg_type == "text":
-                    message += seg.get("data", {}).get("text", "")
-                elif seg_type == "image":
-                    has_image = True
-                    image_segments.append(seg.get("data", {}))
-                elif seg_type == "reply" and reply_segment is None:
-                    reply_segment = seg
-            message = message.strip()
-        elif isinstance(message_raw, str):
-            message = message_raw
-        else:
-            message = str(message_raw)
-
-        return message, has_image, image_segments, reply_segment
-
     # ── 白/黑名单 ─────────────────────────────────
-    def check_access(self, user_id: int, group_id: Optional[int]) -> bool:
+    def check_access(self, user_id, group_id) -> bool:
         if not self.bot._is_whitelisted(user_id, group_id):
             return False
         if self.bot._is_blacklisted(user_id, group_id):
@@ -76,9 +49,9 @@ class MessageProcessor:
         return True
 
     # ── 消息增强: 搜索 / 链接 / 视觉 / 回复引用 ──
-    async def augment(self, user_id: int, message: str, group_id: Optional[int],
-                      has_image: bool, image_segments: List[Dict],
-                      reply_segment: Optional[Dict]) -> Tuple[str, List[str]]:
+    async def augment(self, user_id, message: str, group_id,
+                      has_image: bool, image_segments: list,
+                      reply_to: Optional[str]) -> Tuple[str, List[str]]:
         """附加搜索/链接/视觉/回复引用信息, 返回 (clean_message, extra_info)
 
         设计变更: extra_info 不再拼到用户消息末尾, 而是注入 system prompt 的【预获取信息】区域。
@@ -109,17 +82,17 @@ class MessageProcessor:
                 extra_info.append(f"[链接内容]\n{result}")
 
         # 3. 回复引用
-        if reply_segment:
-            replied_id = reply_segment.get("data", {}).get("id")
+        if reply_to:
+            replied_id = reply_to
             try:
-                replied_id = int(replied_id) if replied_id is not None else None
+                replied_id = int(replied_id) if str(replied_id).isdigit() else replied_id
             except (TypeError, ValueError):
-                replied_id = None
+                replied_id = replied_id
             if replied_id is not None:
                 recalled_msg = None
                 history = self.bot._get_history(user_id, group_id)
                 for msg in history:
-                    if msg.get("message_id") == replied_id:
+                    if str(msg.get("message_id", "")) == str(replied_id):
                         recalled_msg = msg["content"]
                         break
                 if not recalled_msg:
@@ -294,56 +267,43 @@ class MessageProcessor:
 标记会被系统自动处理，用户看不到。修改的回复要自然，不要提"标记"这件事。如果用户问"你叫什么"，就根据当前人设中的名字回答，不需要改昵称。"""
 
 
-    # ── 完整流程: parse → augment → intent → LLM → tag → send ──
-    async def process(self, event: Dict) -> None:
-        """处理单条消息事件 (含 AI 主动回复)"""
-        message_type = event.get("message_type")
-        user_id = event.get("user_id")
-        group_id = event.get("group_id")
-        message_id = event.get("message_id")
+    # ── 完整流程: augment → intent → LLM → tag → send ──
+    async def process(self, message: "Message") -> None:
+        """处理一条统一 Message (含 AI 主动回复)"""
+        channel = message.channel
+        user_id = message.user_id
+        group_id = message.group_id
+        message_id = message.message_id
+        text = message.text
+        has_image = bool(message.images)
 
-        # 1. 解析
-        message, has_image, image_segments, reply_segment = self.parse_event(event)
-        if not message and not has_image:
+        if not text and not has_image:
             return
 
-        # 2. 缓存 message_id → 内容 (供撤回检测)
+        # 1. 缓存 message_id → 内容 (供撤回检测)
         if message_id:
-            self.bot.message_id_buffer[message_id] = message or "[图片]"
+            self.bot.message_id_buffer[message_id] = text or "[图片]"
             self.bot.message_recv_time[message_id] = time.time()
             if len(self.bot.message_id_buffer) > 100:
                 oldest = sorted(self.bot.message_id_buffer.keys())[0]
                 del self.bot.message_id_buffer[oldest]
                 self.bot.message_recv_time.pop(oldest, None)
 
-        # 3. 群聊: 仅响应 @机器人
-        if message_type == "group":
-            bot_id = event.get("self_id")
-            raw_message = event.get("raw_message", "")
-            if (self.bot.config["message"]["group_mention_only"]
-                    and f"[CQ:at,qq={bot_id}]" not in raw_message
-                    and f"@{bot_id}" not in raw_message):
-                return
-            message = raw_message.replace(f"[CQ:at,qq={bot_id}]", "").replace(f"@{bot_id}", "").strip()
-            if not message and not has_image:
-                return
-
-        # 4. 增强消息 (搜索/链接/图片/回复引用) - 返回干净的原文 + extra_info
-        # augment 通常在毫秒级完成，不需要进度消息
+        # 2. 增强消息 (搜索/链接/图片/回复引用) - 返回干净的原文 + extra_info
         clean_message, extra_info = await self.augment(
-            user_id, message, group_id, has_image, image_segments, reply_segment
+            user_id, text, group_id, has_image, message.images, message.reply_to
         )
 
-        # 5. 自然语言资料意图 (在命令检测前)
-        if message:
+        # 3. 自然语言资料意图 (在命令检测前)
+        if text:
             profile_result = await self.bot.profile_manager.detect_and_handle_intent(
-                user_id, message
+                user_id, text
             )
             if profile_result:
                 extra_info.append(profile_result)
 
-        # 6. # 指令处理
-        if message:
+        # 4. # 指令处理
+        if text:
             # QZone 相关命令: 耗时较长, 用进度报告包装
             # 注意: #发动态 / #qzone 自有阶段进度, 不包 with_progress 避免双重进度
             _QZONE_READ_PREFIXES = (
@@ -352,30 +312,30 @@ class MessageProcessor:
                 "#动态详情", "#查看动态",
             )
             _QZONE_PUBLISH_PREFIXES = ("#发动态", "#qzone")
-            if any(message.startswith(p) for p in _QZONE_PUBLISH_PREFIXES):
+            if any(text.startswith(p) for p in _QZONE_PUBLISH_PREFIXES):
                 # 发布命令自有阶段进度回调, 不需要外层 with_progress
                 command_response = await self.bot.command_handler.handle(
-                    user_id, message, group_id
+                    user_id, text, group_id
                 )
-            elif any(message.startswith(p) for p in _QZONE_READ_PREFIXES):
+            elif any(text.startswith(p) for p in _QZONE_READ_PREFIXES):
                 command_response = await self.bot.progress.with_progress(
-                    "查找动态", self.bot.command_handler.handle(user_id, message, group_id),
+                    "查找动态", self.bot.command_handler.handle(user_id, text, group_id),
                     user_id, group_id,
                 )
             else:
                 command_response = await self.bot.command_handler.handle(
-                    user_id, message, group_id
+                    user_id, text, group_id
                 )
             if command_response:
                 logger.info(f"命令回复: {command_response[:30]}")
-                await self._send(message_type, user_id, group_id, command_response)
+                await self._send(channel, user_id, group_id, command_response)
                 return
 
-        # 7. 写入用户原话到历史 (只记原文, 不记搜索结果)
+        # 5. 写入用户原话到历史 (只记原文, 不记搜索结果)
         # 写入护栏: 防御任何代码路径把系统/搜索结果错写成 user 消息
         # 注意: "[图片]" 是合法的"用户只发了图"占位, 不能误伤
-        if message:
-            user_history_text = message
+        if text:
+            user_history_text = text
         elif has_image:
             # 把视觉描述写进历史, 后续 LLM 能看到图的内容
             vision_in_history = ""
@@ -400,15 +360,15 @@ class MessageProcessor:
         if user_history_text:
             self.bot._add_message(user_id, "user", user_history_text, group_id)
 
-        # 8. LLM 生成 - 传入干净的原文 + extra_info 注入 system prompt
-        # Tool-calling 也可能较慢，同样包裹进度消息
+        # 6. LLM 生成 - 传入干净的原文 + extra_info 注入 system prompt
         response = await self.bot.progress.with_progress(
-            "处理", self.generate_response(user_id, clean_message, group_id, extra_info=extra_info if extra_info else None),
+            "处理", self.generate_response(user_id, clean_message, group_id,
+                                           extra_info=extra_info if extra_info else None),
             user_id, group_id,
         )
         logger.info(f"生成回复: {response[:50]}")
 
-        # 8.5 撤回幻觉防御: LLM 输出含"撤回"字样, 但当前 message_id 不在已验证白名单 → 幻觉, 替换
+        # 6.5 撤回幻觉防御: LLM 输出含"撤回"字样, 但当前 message_id 不在已验证白名单 → 幻觉, 替换
         if "撤回" in response and message_id not in self.bot._verified_recall_ids:
             logger.warning(
                 f"[HALLUCIN_FILTER] LLM 幻觉 '撤回', "
@@ -416,13 +376,13 @@ class MessageProcessor:
             )
             response = "嗯? 啥撤回? 没看到你撤回啊"
 
-        # 9. 处理 [PROFILE_CHANGE:] 等标记 (带 user_text 做"显式改动"校验)
+        # 7. 处理 [PROFILE_CHANGE:] 等标记 (带 user_text 做"显式改动"校验)
         response = await self.bot.profile_manager.parse_and_execute_profile_changes(
-            response, user_id, user_text=message
+            response, user_id, user_text=text
         )
 
-        # 10. 发送并写入历史
-        real_msg_id = await self._send(message_type, user_id, group_id, response)
+        # 8. 发送并写入历史
+        real_msg_id = await self._send(channel, user_id, group_id, response)
         self.bot._add_message(
             user_id, "assistant", response, group_id,
             real_message_id=real_msg_id,
@@ -431,12 +391,11 @@ class MessageProcessor:
         if real_msg_id:
             self.bot.message_id_buffer[real_msg_id] = response
 
-        # 11. 长期记忆抽取: 每 6 轮用户消息触发一次 (后台, 不阻塞)
-        if message:
+        # 9. 长期记忆抽取: 每 6 轮用户消息触发一次 (后台, 不阻塞)
+        if text:
             history = self.bot._get_history(user_id, group_id)
             user_msg_count = sum(1 for m in history if m.get("role") == "user")
             if user_msg_count > 0 and user_msg_count % 6 == 0:
-                # 把最近 6 轮对话拼成 transcript
                 recent = history[-12:]
                 transcript = "\n".join(
                     f"[{m['role']}] {m['content'][:200]}" for m in recent
@@ -447,9 +406,5 @@ class MessageProcessor:
                     )
                 )
 
-    async def _send(self, message_type: str, user_id: int,
-                    group_id: Optional[int], message: str) -> Optional[int]:
-        if message_type == "group" and group_id is not None:
-            await self.bot._send_group_msg(group_id, message)
-            return None
-        return await self.bot._send_private_msg(user_id, message)
+    async def _send(self, channel: str, user_id, group_id, message: str) -> Optional[int]:
+        return await self.bot.send_text(channel, user_id, group_id, message)
