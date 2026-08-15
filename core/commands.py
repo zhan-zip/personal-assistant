@@ -35,6 +35,12 @@ class CommandHandler:
         # ── 基础指令 ──
         if message.startswith("#重置") or message.startswith("#clear") or message.startswith("#cls"):
             self.bot._clear_history(user_id, group_id)
+            # 同时清该用户的长期记忆 (user_facts), 实现彻底重置
+            try:
+                self.bot.long_memory.clear(user_id)
+                logger.info(f"#重置 已清空长期记忆: user={user_id}")
+            except Exception as e:
+                logger.warning(f"#重置 清长期记忆失败: {e}")
             return "记忆已清除。"
 
         if message.startswith("#人设") or message.startswith("#persona"):
