@@ -188,4 +188,36 @@ class LLMClient:
             return json.loads(raw)
         except (json.JSONDecodeError, Exception) as e:
             logger.warning(f"_chat_json 解析失败: {e}, raw={raw[:200]}")
+
+    # ── 向量化 (RAG 语义记忆) ────────────────────
+    async def embed_texts(self, texts: List[str]) -> Optional[List[List[float]]]:
+        """文本向量化: 用配置里带 embedding 模型的 provider (DashScope text-embedding-v3, 1024 维)
+
+        - 批量 10 条一次 (DashScope 限制)
+        - 失败返回 None, 调用方降级为纯关键词检索 (FTS5)
+        """
+        texts = [t for t in (texts or []) if t and t.strip()]
+        if not texts:
+            return []
+        client, model_name = None, None
+        for prov_name, prov_cfg in self.config.get("providers", {}).items():
+            m = (prov_cfg.get("models") or {}).get("embedding")
+            if m and prov_name in self.providers:
+                client, model_name = self.providers[prov_name], m
+                break
+        if client is None:
+            logger.warning("[LLM] 未配置可用的 embedding provider")
+            return None
+        try:
+            results: List[List[float]] = []
+            for i in range(0, len(texts), 10):
+                batch = texts[i:i + 10]
+                resp = await asyncio.to_thread(
+                    lambda: client.embeddings.create(model=model_name, input=batch)
+                )
+                results.extend([d.embedding for d in resp.data])
+            return results
+        except Exception as e:
+            logger.error(f"[LLM] embedding 调用失败: {e}")
+            return None
             return None

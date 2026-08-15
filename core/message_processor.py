@@ -361,6 +361,17 @@ class MessageProcessor:
             self.bot._add_message(user_id, "user", user_history_text, group_id)
 
         # 6. LLM 生成 - 传入干净的原文 + extra_info 注入 system prompt
+        if extra_info is None:
+            extra_info = []
+        # 6.1 语义记忆检索 (RAG): 把用户之前相关历史注入 system prompt
+        related = await self._retrieve_related_memories(
+            user_id, group_id, clean_message
+        )
+        if related:
+            extra_info.append(
+                "[相关记忆 - 用户之前提到过的内容, 可在适当时自然引用]\n"
+                + "\n".join(related)
+            )
         response = await self.bot.progress.with_progress(
             "处理", self.generate_response(user_id, clean_message, group_id,
                                            extra_info=extra_info if extra_info else None),
@@ -405,6 +416,33 @@ class MessageProcessor:
                         user_id, transcript, self.bot.llm
                     )
                 )
+
+    # ── RAG 语义记忆检索 ──────────────────────────
+    async def _retrieve_related_memories(self, user_id: int,
+                                         group_id: Optional[int],
+                                         query: str) -> List[str]:
+        """语义检索相关历史记忆, 返回可注入 system prompt 的文本片段列表 (空=无)"""
+        vs = getattr(self.bot, "vector_store", None)
+        if vs is None or not (query or "").strip():
+            return []
+        vcfg = self.bot.config.get("memory", {}).get("vector", {}) or {}
+        top_k = int(vcfg.get("top_k", 5))
+        threshold = vcfg.get("threshold")
+        try:
+            vecs = await self.bot.llm.embed_texts([query])
+            if not vecs:
+                return []
+            hits = await vs.search(vecs[0], limit=top_k, threshold=threshold)
+        except Exception as e:
+            logger.warning(f"[VEC] 相关记忆检索失败: {e}")
+            return []
+        lines: List[str] = []
+        for h in hits:
+            role_label = "我" if h.get("role") == "assistant" else "你"
+            content = (h.get("content") or "").strip()[:200]
+            if content:
+                lines.append(f"{role_label}: {content}")
+        return lines
 
     async def _send(self, channel: str, user_id, group_id, message: str) -> Optional[int]:
         return await self.bot.send_text(channel, user_id, group_id, message)

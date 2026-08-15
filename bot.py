@@ -116,6 +116,9 @@ class QQBot:
         # 外部 MCP 客户端 (如 Food-Time 饮食工具), 启动时连接并入 tool-calling
         self.mcp_clients: Dict[str, Any] = {}
 
+        # 向量记忆 (RAG 语义检索, ChromaDB), 启动时构建, 失败降级为纯关键词检索
+        self.vector_store: Optional[Any] = None
+
         # 撤回相关
         self.message_id_buffer: Dict[str, Any] = {}
         # message_id → 接收时间 (用于周期性撤回扫描: 只检查最近 N 分钟内收到的)
@@ -346,6 +349,15 @@ class QQBot:
             ))
         except Exception as e:
             logger.warning(f"[MEM] 落盘失败: {e}")
+        # 异步同步到向量库 (语义记忆, 失败仅警告不阻断)
+        if getattr(self, "vector_store", None) is not None:
+            try:
+                asyncio.create_task(self.vector_store.add_message(
+                    key, msg["role"], msg["content"], msg["timestamp"],
+                    self.llm.embed_texts,
+                ))
+            except Exception as e:
+                logger.warning(f"[VEC] 向量同步失败: {e}")
 
     def _clear_history(self, user_id: int, group_id: Optional[int] = None) -> bool:
         key = self._get_cache_key(user_id, group_id)
@@ -388,6 +400,22 @@ class QQBot:
         except Exception as e:
             logger.warning(f"[MEM] 长期记忆加载失败: {e}")
         logger.info(f"[MEM] 记忆已加载: {len(self.chat_memory)} 个会话")
+
+    async def _init_vector_store(self):
+        """启动时构建向量记忆 (ChromaDB, 幂等)。失败降级为纯关键词检索, 不影响 bot 启动"""
+        try:
+            from core.vector_store import VectorStore
+            vcfg = self.config.get("memory", {}).get("vector", {}) or {}
+            if not vcfg.get("enabled", True):
+                logger.info("[VEC] 向量记忆已在配置中关闭")
+                return
+            vs = VectorStore(persist_dir=vcfg.get("persist_dir", "vector_db"))
+            await vs.rebuild(self.chat_memory, self.llm.embed_texts)
+            self.vector_store = vs
+            logger.info(f"[VEC] 语义记忆就绪 (共 {vs.count()} 条)")
+        except Exception as e:
+            logger.warning(f"[VEC] 向量库初始化失败, 降级为关键词检索: {e}")
+            self.vector_store = None
 
     # ==================== 资料初始化 (启动时调用一次) ====================
 
@@ -773,6 +801,7 @@ class QQBot:
     async def run(self):
         """主循环: 并发连接所有 adapter, 各自断线自动重连"""
         await self._init_memory()   # 从 SQLite 载入记忆 / 迁移旧 JSON
+        await self._init_vector_store()   # 语义记忆向量库 (失败自动降级关键词检索)
         await self._init_mcp_clients()   # 连接外部 MCP server (如 Food-Time)
         tasks = [
             asyncio.create_task(self._adapter_loop(name, adp))

@@ -19,6 +19,9 @@ memory.db
 memory.db-shm
 memory.db-wal
 
+# ── 向量记忆 (ChromaDB 持久化) ──
+vector_db/
+
 # ── 沙箱工作目录 (文件工具写入的用户笔记/数据) ──
 workspace/
 

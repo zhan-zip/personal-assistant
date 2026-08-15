@@ -130,3 +130,10 @@ qzone:
 
 workspace:
   dir: "workspace"   # 沙箱工作目录: 文件工具(read_file/write_file/append_file/list_files)只能读写这里
+
+memory:
+  vector:   # 语义记忆 RAG (ChromaDB + DashScope text-embedding-v3, 复用 VISION 密钥)
+    enabled: true      # false 则纯关键词检索 (FTS5)
+    persist_dir: "vector_db"   # ChromaDB 持久化目录 (已 gitignore)
+    top_k: 5           # 每轮检索注入的相关记忆条数
+    # threshold: 1.3   # 距离阈值 (l2), 超过视为不相关; 留空=不过滤, 靠 top_k 限制
