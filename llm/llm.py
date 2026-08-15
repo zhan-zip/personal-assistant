@@ -2,7 +2,10 @@
 LLM 客户端 + 高层对话助手
 
 所有调用大模型的入口都收口在本模块:
-- LLMClient:    同步 LLM 调用 (用 to_thread 异步执行)
+- LLMClient: 多 provider 路由 + 容灾 (failover)
+    - 每个 provider 一个 OpenAI client (deepseek / qwen / ...)
+    - 按 task_type 路由到指定 provider + model
+    - 主 provider 调用失败时自动切 fallback_chain 里的备用 provider
 - chat_with_persona: 把人设 + 用户消息打包, 调用 LLM, 返回纯文本
 - extract_json_decision: 容错从 LLM 输出中抠出 JSON
 """
@@ -37,27 +40,59 @@ def extract_json_decision(content: str) -> Optional[Dict]:
 
 
 class LLMClient:
-    """LLM 对话客户端
+    """多 provider LLM 客户端
 
-    - 构造时绑定 OpenAI 客户端 + 默认参数
-    - chat(): 同步调用, 包成异步 (to_thread)
-    - chat_with_persona(): 高层人设对话助手
+    - providers: {"deepseek": OpenAI-client, "qwen": OpenAI-client, ...}
+    - config: llm 配置段, 含 providers / routing / fallback_chain
+    - routing 决定 task_type → (provider, model_role) 的映射:
+        e.g. routing.default = "deepseek.chat"
+             routing.reasoner = "deepseek.reasoner"   (预留位, 暂不启用)
+             routing.vision = "qwen.vision"
+    - fallback_chain: ["deepseek", "qwen"] 主 provider 失败时按序切换
     """
 
-    def __init__(self, client: OpenAI, model: str,
+    def __init__(self, providers: Dict[str, OpenAI], config: Dict,
                  temperature: float = 0.6,
                  max_tokens: int = 2048):
-        self.client = client
-        self.model = model
+        self.providers = providers
+        self.config = config or {}
         self.temperature = temperature
         self.max_tokens = max_tokens
 
+    # ── 路由 ──────────────────────────────────────────
+    def _resolve(self, task_type: str = "default"):
+        """返回 (主 provider, model_role, 容灾 chain)"""
+        routing = self.config.get("routing", {}) or {}
+        key = routing.get(task_type) or routing.get("default") or "deepseek.chat"
+        prov, role = key.split(".", 1)
+        chain = routing.get("fallback_chain") or [prov]
+        return prov, role, chain
+
+    def _model_name(self, prov: str, role: str) -> str:
+        prov_cfg = self.config.get("providers", {}).get(prov, {})
+        models = prov_cfg.get("models", {}) or {}
+        return models.get(role) or role
+
+    def _iter_providers(self, task_type: str):
+        """按优先级 yield (provider_name, client, model_name)"""
+        prov, role, chain = self._resolve(task_type)
+        seen = set()
+        order = [prov] + [c for c in chain if c != prov]
+        for name in order:
+            if name in seen:
+                continue
+            seen.add(name)
+            client = self.providers.get(name)
+            if client is None:
+                continue
+            yield name, client, self._model_name(name, role)
+
     # ── 同步调用 (内部) ──────────────────────────────
-    def _chat_sync(self, messages: List[Dict],
+    def _chat_sync(self, client: OpenAI, model: str, messages: List[Dict],
                    temperature: Optional[float] = None,
                    max_tokens: Optional[int] = None) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
+        resp = client.chat.completions.create(
+            model=model,
             messages=messages,
             temperature=temperature if temperature is not None else self.temperature,
             max_tokens=max_tokens if max_tokens is not None else self.max_tokens,
@@ -67,26 +102,29 @@ class LLMClient:
 
     async def chat(self, messages: List[Dict],
                    temperature: Optional[float] = None,
-                   max_tokens: Optional[int] = None) -> str:
-        try:
-            return await asyncio.to_thread(
-                self._chat_sync, messages, temperature, max_tokens
-            )
-        except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            return ""
+                   max_tokens: Optional[int] = None,
+                   task_type: str = "default") -> str:
+        """普通对话, 失败自动切备用 provider, 全部失败返回空串"""
+        last_err = None
+        for name, client, model in self._iter_providers(task_type):
+            try:
+                return await asyncio.to_thread(
+                    self._chat_sync, client, model, messages, temperature, max_tokens
+                )
+            except Exception as e:
+                last_err = e
+                logger.error(f"LLM {name}/{model} 调用失败: {e}")
+        logger.error(f"LLM 所有 provider 均失败: {last_err}")
+        return ""
 
     # ── Tool-calling 支持 ────────────────────────────
-    def _chat_sync_with_tools(self, messages: List[Dict],
-                              tools: List[Dict],
+    def _chat_sync_with_tools(self, client: OpenAI, model: str,
+                              messages: List[Dict], tools: List[Dict],
                               temperature: Optional[float] = None,
                               max_tokens: Optional[int] = None):
-        """同步调用 LLM (带 tools), 返回完整 message 对象
-
-        调用方通过 result.tool_calls / result.content 判断是否有工具调用
-        """
-        resp = self.client.chat.completions.create(
-            model=self.model,
+        """同步调用 LLM (带 tools), 返回完整 message 对象"""
+        resp = client.chat.completions.create(
+            model=model,
             messages=messages,
             tools=tools,
             tool_choice="auto",
@@ -99,19 +137,21 @@ class LLMClient:
     async def chat_with_tools(self, messages: List[Dict],
                               tools: List[Dict],
                               temperature: Optional[float] = None,
-                              max_tokens: Optional[int] = None):
-        """异步 LLM 调用 (带 tools), 返回 message 对象
-
-        Returns:
-            ChatCompletionMessage | None (失败时返回 None)
-        """
-        try:
-            return await asyncio.to_thread(
-                self._chat_sync_with_tools, messages, tools, temperature, max_tokens
-            )
-        except Exception as e:
-            logger.error(f"LLM tool-calling 失败: {e}")
-            return None
+                              max_tokens: Optional[int] = None,
+                              task_type: str = "default"):
+        """带工具对话, 失败自动切备用 provider, 全部失败返回 None"""
+        last_err = None
+        for name, client, model in self._iter_providers(task_type):
+            try:
+                return await asyncio.to_thread(
+                    self._chat_sync_with_tools, client, model,
+                    messages, tools, temperature, max_tokens,
+                )
+            except Exception as e:
+                last_err = e
+                logger.error(f"LLM tool-calling {name}/{model} 失败: {e}")
+        logger.error(f"LLM tool-calling 所有 provider 均失败: {last_err}")
+        return None
 
     # ── 高层助手 ──────────────────────────────────
     async def chat_with_persona(self, persona: str, system_extra: str,

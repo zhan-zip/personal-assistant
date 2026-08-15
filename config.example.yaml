@@ -9,9 +9,27 @@ web:
   port: 8080
 
 llm:
-  api_key: ""   # 从 .env 的 DEEPSEEK_API_KEY 加载
-  base_url: ""  # 从 .env 的 DEEPSEEK_BASE_URL 加载
-  model: ""     # 从 .env 的 DEEPSEEK_MODEL 加载
+  providers:
+    deepseek:                       # 主对话（便宜，deepseek-chat）
+      api_key: ""                   # 从 .env 的 DEEPSEEK_API_KEY 加载
+      base_url: ""                  # 从 .env 的 DEEPSEEK_BASE_URL 加载
+      models:
+        chat: ""                    # 从 .env 的 DEEPSEEK_MODEL 加载 (默认 deepseek-chat)
+        reasoner: "deepseek-reasoner"   # 复杂推理：路由位预留，暂不启用
+    qwen:                           # 容灾 + 视觉（复用视觉专属空间的 key）
+      api_key: ""                   # 从 .env 的 VISION_API_KEY 加载
+      base_url: ""                  # 从 .env 的 VISION_BASE_URL 加载
+      models:
+        chat: ""                    # 从 .env 的 QWEN_MODEL 加载 (默认 qwen-plus)
+        reasoner: "qwen-max"
+        vision: ""                  # 从 .env 的 VISION_MODEL 加载 (默认 qwen-vl-max)
+        embedding: "text-embedding-v3"  # 观察中，暂不启用
+  routing:
+    default: "deepseek.chat"                # 默认主对话
+    reasoner: "deepseek.reasoner"           # 复杂推理：预留位，暂不启用
+    vision: "qwen.vision"
+    embedding: "qwen.embedding"             # 观察中，暂不启用
+    fallback_chain: ["deepseek", "qwen"]    # 主模型失败自动切备用
   max_tokens: 2048
   temperature: 0.6
   max_history: 20

@@ -59,10 +59,15 @@ class QQBot:
         # 配置 / 客户端
         self.config = self._load_config(config_path)
         self._apply_env_to_config(self.config)
-        self.client = OpenAI(
-            api_key=self.config["llm"]["api_key"],
-            base_url=self.config["llm"]["base_url"],
-        )
+
+        # LLM providers (多模型路由 + 容灾): name → OpenAI client
+        self._llm_clients: Dict[str, OpenAI] = {}
+        for name, prov in self.config["llm"].get("providers", {}).items():
+            if prov.get("api_key"):
+                self._llm_clients[name] = OpenAI(
+                    api_key=prov["api_key"],
+                    base_url=prov["base_url"],
+                )
 
         vcfg = self.config.get("vision", {})
         self.vision_client = None
@@ -142,8 +147,8 @@ class QQBot:
 
         # 子系统
         self.llm = LLMClient(
-            client=self.client,
-            model=self.config["llm"]["model"],
+            providers=self._llm_clients,
+            config=self.config["llm"],
             temperature=self.config["llm"]["temperature"],
             max_tokens=self.config["llm"]["max_tokens"],
         )
@@ -184,13 +189,29 @@ class QQBot:
     @staticmethod
     def _apply_env_to_config(config: Dict):
         """将 .env 中的环境变量注入到 config 中，覆盖空值占位符"""
-        # LLM
-        if not config["llm"]["api_key"]:
-            config["llm"]["api_key"] = os.getenv("DEEPSEEK_API_KEY", "")
-        if not config["llm"]["base_url"]:
-            config["llm"]["base_url"] = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        if not config["llm"]["model"]:
-            config["llm"]["model"] = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+        # LLM providers (多模型路由): deepseek 主对话, qwen 容灾/视觉
+        lcfg = config.setdefault("llm", {})
+        providers = lcfg.setdefault("providers", {})
+        for name, prov in providers.items():
+            if name == "deepseek":
+                if not prov.get("api_key"):
+                    prov["api_key"] = os.getenv("DEEPSEEK_API_KEY", "")
+                if not prov.get("base_url"):
+                    prov["base_url"] = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+                models = prov.setdefault("models", {})
+                if not models.get("chat"):
+                    models["chat"] = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+            elif name == "qwen":
+                # qwen 容灾 provider 复用视觉专属空间的 key / base_url
+                if not prov.get("api_key"):
+                    prov["api_key"] = os.getenv("VISION_API_KEY", "")
+                if not prov.get("base_url"):
+                    prov["base_url"] = os.getenv("VISION_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+                models = prov.setdefault("models", {})
+                if not models.get("chat"):
+                    models["chat"] = os.getenv("QWEN_MODEL", "qwen-plus")
+                if not models.get("vision"):
+                    models["vision"] = os.getenv("VISION_MODEL", "qwen-vl-max")
 
         # Vision
         vcfg = config.get("vision", {})
