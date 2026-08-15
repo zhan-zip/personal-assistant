@@ -12,8 +12,9 @@
 
 import json
 import logging
+import os
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from core.utils import BEIJING_TZ
 
@@ -200,6 +201,151 @@ TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "读取沙箱工作目录里的一个文件内容。"
+                "当用户让你读取某个文件/笔记/文档内容时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "文件名 (相对沙箱工作目录, 如 notes/idea.txt)",
+                    },
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "在沙箱工作目录里写入一个文件 (覆盖已有内容)。"
+                "当用户让你记录/保存内容到文件时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "文件名 (相对沙箱工作目录)",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要写入的完整内容",
+                    },
+                },
+                "required": ["filename", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": (
+                "在沙箱工作目录里追加内容到文件末尾 (不覆盖已有内容)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "文件名 (相对沙箱工作目录)",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要追加的内容",
+                    },
+                },
+                "required": ["filename", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "列出沙箱工作目录里的文件。"
+                "当用户问「你有哪些文件/笔记」「看看记录」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "子目录路径 (默认空=根目录)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_todo",
+            "description": (
+                "新增一条待办事项。当用户说「记住/帮我记个待办/我要做X」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "待办内容",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_todos",
+            "description": (
+                "列出当前用户的待办事项。当用户问「我有什么待办/要做的事」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_todo",
+            "description": (
+                "更新一条待办的状态 (pending/done/cancelled)。"
+                "当用户说「这件事做完了/取消了/标记完成」时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todo_id": {
+                        "type": "integer",
+                        "description": "待办 id (来自 list_todos)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "done", "cancelled"],
+                        "description": "新状态",
+                    },
+                },
+                "required": ["todo_id", "status"],
+            },
+        },
+    },
 ]
 
 # ── 工具可读名称 (用于 system prompt) ──────────────────────
@@ -221,11 +367,15 @@ TOOLS_README = """
    - mode='target'(+target_uin): 指定QQ号的动态（必须先用 resolve_qq）
 7. publish_qzone_feed(content) — 发QQ空间动态
 8. recognize_image(image_url) — 视觉识别图片内容
+9. read_file(filename) / write_file(filename, content) / append_file(filename, content) / list_files(path) — 读写沙箱工作目录里的文件(笔记/记录)
+10. create_todo(content) / list_todos() / update_todo(id, status) — 待办事项管理
 
 【调用规则】
 - 涉及「空间/动态/说说/好友圈/看看XXX」→ 先 resolve_qq 再 get_qzone_feeds
 - 涉及「昵称/签名/个签/性别/QQ号/个人资料」→ 调用 get_bot_profile
 - 涉及「查查XXX/XXX是谁」→ 调用 resolve_qq 或 get_user_info
+- 涉及「读文件/看笔记/记录/保存」→ 调用 read_file/write_file/append_file/list_files
+- 涉及「待办/要做的事/记一下/做完/取消」→ 调用 create_todo/list_todos/update_todo
 - 搜索结果返回多个疑似用户时，列出所有结果让用户选择
 
 【歧义处理】
@@ -237,8 +387,113 @@ TOOLS_README = """
 - 工具返回的原始数据请用自然语言总结后输出
 """
 
-
 # ── 工具执行分发 ──────────────────────────────────────────
+
+
+def _safe_workspace_path(bot, filename: str) -> Optional[str]:
+    """解析沙箱内文件绝对路径; 越出沙箱返回 None"""
+    ws = bot.config.get("workspace", {}).get("dir", "workspace")
+    base = os.path.realpath(ws)
+    if not os.path.exists(base):
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            return None
+    target = os.path.realpath(os.path.join(base, filename or ""))
+    if target != base and not target.startswith(base + os.sep):
+        return None
+    return target
+
+
+async def _exec_file_tool(bot, tool_name: str, arguments: Dict) -> str:
+    """沙箱文件工具: read_file / write_file / append_file / list_files"""
+    if tool_name == "list_files":
+        sub = str(arguments.get("path", "") or "")
+        base = os.path.realpath(bot.config.get("workspace", {}).get("dir", "workspace"))
+        os.makedirs(base, exist_ok=True)
+        target = os.path.realpath(os.path.join(base, sub)) if sub else base
+        if target != base and not target.startswith(base + os.sep):
+            return "[错误] 路径越出沙箱目录"
+        if not os.path.isdir(target):
+            return "[错误] 目录不存在"
+        items = sorted(os.listdir(target))
+        if not items:
+            return "目录为空"
+        lines = []
+        for it in items:
+            full = os.path.join(target, it)
+            kind = "目录" if os.path.isdir(full) else "文件"
+            lines.append(f"- {it} ({kind})")
+        return "\n".join(lines)
+
+    filename = arguments.get("filename", "")
+    path = _safe_workspace_path(bot, filename)
+    if not path:
+        return "[错误] 文件路径无效或越出沙箱目录"
+
+    if tool_name == "read_file":
+        if not os.path.isfile(path):
+            return f"[错误] 文件不存在: {filename}"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            return f"[错误] 读取失败: {e}"
+        return content[:2000] + ("\n...(内容过长已截断)" if len(content) > 2000 else "")
+
+    content = str(arguments.get("content", ""))
+    if tool_name == "write_file":
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"已写入 {filename}"
+        except Exception as e:
+            return f"[错误] 写入失败: {e}"
+    if tool_name == "append_file":
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n" + content if os.path.exists(path) and os.path.getsize(path) else content)
+            return f"已追加到 {filename}"
+        except Exception as e:
+            return f"[错误] 追加失败: {e}"
+    return "[错误] 未知文件操作"
+
+
+async def _exec_todo_tool(bot, tool_name: str, arguments: Dict, user_id: int) -> str:
+    """待办工具: create_todo / list_todos / update_todo (走 SQLite todos 表)"""
+    store = bot.memory_store
+    if tool_name == "create_todo":
+        content = str(arguments.get("content", "")).strip()
+        if not content:
+            return "[错误] 待办内容不能为空"
+        from core.utils import now_iso
+        todo_id = await store.add_todo(str(user_id), content[:200], now_iso())
+        return f"已添加待办 #{todo_id}: {content[:80]}"
+
+    if tool_name == "list_todos":
+        todos = await store.list_todos(str(user_id))
+        if not todos:
+            return "暂无待办事项"
+        lines = ["当前待办:"]
+        for t in todos:
+            mark = {"pending": "[ ]", "done": "[x]", "cancelled": "[-]"}.get(t["status"], "[?]")
+            lines.append(f"  {mark} #{t['id']} {t['content']} ({t['status']})")
+        return "\n".join(lines)
+
+    if tool_name == "update_todo":
+        try:
+            todo_id = int(arguments.get("todo_id"))
+        except (TypeError, ValueError):
+            return "[错误] todo_id 必须是数字"
+        status = str(arguments.get("status", "")).strip()
+        if status not in ("pending", "done", "cancelled"):
+            return "[错误] status 只能是 pending/done/cancelled"
+        ok = await store.update_todo(todo_id, status)
+        return f"已更新待办 #{todo_id} → {status}" if ok else f"[错误] 待办 #{todo_id} 不存在"
+    return "[错误] 未知待办操作"
+
 
 async def execute_tool(bot: "QQBot", tool_name: str,
                        arguments: Dict[str, Any],
@@ -581,6 +836,12 @@ async def execute_tool(bot: "QQBot", tool_name: str,
             if desc:
                 return f"[图片识别结果]:\n{desc}"
             return "[图片识别失败, 可能URL不可访问或不是有效的图片]"
+
+        elif tool_name in ("read_file", "write_file", "append_file", "list_files"):
+            return await _exec_file_tool(bot, tool_name, arguments)
+
+        elif tool_name in ("create_todo", "list_todos", "update_todo"):
+            return await _exec_todo_tool(bot, tool_name, arguments, user_id)
 
         else:
             return f"[错误] 未知工具: {tool_name}"

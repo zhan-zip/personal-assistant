@@ -127,3 +127,6 @@ qzone:
     - 内容保持1-3句话，口语化、自然，符合你的性格
     - 可以分享当下的感受、想法、观察，但不要刻意
     - 不要频繁发，没有想说的就输出 none
+
+workspace:
+  dir: "workspace"   # 沙箱工作目录: 文件工具(read_file/write_file/append_file/list_files)只能读写这里

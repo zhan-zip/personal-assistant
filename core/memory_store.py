@@ -183,6 +183,40 @@ class MemoryStore:
             out[uid] = {"facts": facts, "updated_at": updated_at}
         return out
 
+    # ── 待办 todos ──
+    async def add_todo(self, user_id, content: str, created_at: str) -> Optional[int]:
+        """新增一条待办, 返回 id"""
+        await self.init()
+        cur = await self._conn.execute(
+            "INSERT INTO todos (user_id, content, status, created_at) VALUES (?,?,?,?)",
+            (str(user_id), content, "pending", created_at),
+        )
+        await self._conn.commit()
+        return cur.lastrowid
+
+    async def list_todos(self, user_id, status: Optional[str] = None) -> List[Dict]:
+        """列出某用户待办 (可按状态过滤), 按创建时间倒序"""
+        await self.init()
+        sql = ("SELECT id, content, status, created_at FROM todos WHERE user_id=?")
+        params = [str(user_id)]
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        sql += " ORDER BY id DESC"
+        cur = await self._conn.execute(sql, params)
+        rows = await cur.fetchall()
+        return [{"id": r[0], "content": r[1], "status": r[2], "created_at": r[3]}
+                for r in rows]
+
+    async def update_todo(self, todo_id: int, status: str) -> bool:
+        """更新待办状态 (pending/done/cancelled), 返回是否命中"""
+        await self.init()
+        cur = await self._conn.execute(
+            "UPDATE todos SET status=? WHERE id=?", (status, todo_id)
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
     # ── FTS5 关键词检索 ──
     async def search_memory(self, query: str, session_id: Optional[str] = None,
                             limit: int = 8) -> List[Dict]:
