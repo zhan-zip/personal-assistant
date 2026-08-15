@@ -208,6 +208,20 @@ class MemoryStore:
         return [{"id": r[0], "content": r[1], "status": r[2], "created_at": r[3]}
                 for r in rows]
 
+    async def list_all_todos(self, status: Optional[str] = None) -> List[Dict]:
+        """列出所有用户待办 (MCP 等跨用户场景用), 按创建时间倒序"""
+        await self.init()
+        sql = "SELECT id, user_id, content, status, created_at FROM todos"
+        params: list = []
+        if status:
+            sql += " WHERE status=?"
+            params.append(status)
+        sql += " ORDER BY id DESC"
+        cur = await self._conn.execute(sql, params)
+        rows = await cur.fetchall()
+        return [{"id": r[0], "user_id": r[1], "content": r[2],
+                 "status": r[3], "created_at": r[4]} for r in rows]
+
     async def update_todo(self, todo_id: int, status: str) -> bool:
         """更新待办状态 (pending/done/cancelled), 返回是否命中"""
         await self.init()

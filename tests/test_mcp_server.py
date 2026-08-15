@@ -16,12 +16,25 @@ from mcp_integration.server import create_bot_mcp
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+class MockStore:
+    """假的待办存储, 用于 MCP read_todos 测试"""
+    def __init__(self):
+        self.todos = []
+
+    async def list_todos(self, uid, status=None):
+        return [t for t in self.todos if t["user_id"] == uid]
+
+    async def list_all_todos(self, status=None):
+        return self.todos
+
+
 class MockBot:
     running = True
     current_nickname = "WEN"
     current_signature = "测试签名"
     adapters = {"onebot": type("A", (), {"connected": True})()}
     sent = []
+    memory_store = MockStore()
 
     async def _send_private_msg(self, uid, msg):
         self.sent.append((uid, msg))
@@ -50,13 +63,20 @@ async def test_tools_registered():
 
 async def test_call_tools():
     bot = MockBot()
+    bot.memory_store.todos = [
+        {"id": 1, "user_id": "3496326306", "content": "明天做优化", "status": "pending", "created_at": "t1"},
+    ]
     s = create_bot_mcp(bot)
     r1 = await s.call_tool("get_status", {})
     assert "running=True" in _text(r1), _text(r1)
     r2 = await s.call_tool("get_bot_profile", {})
     assert "WEN" in _text(r2), _text(r2)
     r3 = await s.call_tool("read_todos", {})
-    assert "Phase 4" in _text(r3), _text(r3)
+    assert "明天做优化" in _text(r3), _text(r3)
+    r3b = await s.call_tool("read_todos", {"user_id": "3496326306"})
+    assert "明天做优化" in _text(r3b), _text(r3b)
+    r3c = await s.call_tool("read_todos", {"user_id": "999"})
+    assert "暂无待办" in _text(r3c), _text(r3c)
     r4 = await s.call_tool("notify_user", {"user_id": "3496326306", "message": "hello"})
     assert "已发送" in _text(r4), _text(r4)
     assert bot.sent == [(3496326306, "hello")]

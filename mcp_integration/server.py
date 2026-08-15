@@ -16,6 +16,7 @@ bot 作为 MCP Server: 暴露能力给其他 agent (opencode / 知识库等)
 """
 import asyncio
 import logging
+from typing import Optional
 
 from mcp.server import MCPServer
 
@@ -67,9 +68,25 @@ def create_bot_mcp(bot=None) -> MCPServer:
                 f"签名: {bot.current_signature or '无'}")
 
     @server.tool()
-    def read_todos() -> str:
-        """读取当前待办列表(暂未实现, Phase 4)。"""
-        return "待办功能尚未实现 (Phase 4)"
+    async def read_todos(user_id: Optional[str] = None) -> str:
+        """读取待办列表。可传 user_id 只看某人的; 不传则返回全部待办 (来自 SQLite)。"""
+        if bot is None:
+            return "bot 未就绪"
+        try:
+            if user_id:
+                todos = await bot.memory_store.list_todos(str(user_id))
+            else:
+                todos = await bot.memory_store.list_all_todos()
+        except Exception as e:
+            return f"读取待办失败: {e}"
+        if not todos:
+            return "暂无待办"
+        lines = ["待办列表:"]
+        for t in todos:
+            uid = t.get("user_id", "")
+            mark = {"pending": "[ ]", "done": "[x]", "cancelled": "[-]"}.get(t["status"], "[?]")
+            lines.append(f"  {mark} #{t['id']} user={uid} {t['content']} ({t['status']})")
+        return "\n".join(lines)
 
     return server
 
