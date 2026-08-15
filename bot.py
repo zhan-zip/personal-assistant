@@ -113,6 +113,9 @@ class QQBot:
         self._retry_count = 0
         self._bg_started = False
 
+        # 外部 MCP 客户端 (如 Food-Time 饮食工具), 启动时连接并入 tool-calling
+        self.mcp_clients: Dict[str, Any] = {}
+
         # 撤回相关
         self.message_id_buffer: Dict[str, Any] = {}
         # message_id → 接收时间 (用于周期性撤回扫描: 只检查最近 N 分钟内收到的)
@@ -770,11 +773,28 @@ class QQBot:
     async def run(self):
         """主循环: 并发连接所有 adapter, 各自断线自动重连"""
         await self._init_memory()   # 从 SQLite 载入记忆 / 迁移旧 JSON
+        await self._init_mcp_clients()   # 连接外部 MCP server (如 Food-Time)
         tasks = [
             asyncio.create_task(self._adapter_loop(name, adp))
             for name, adp in self.adapters.items()
         ]
         await asyncio.gather(*tasks)
+
+    async def _init_mcp_clients(self):
+        """连接外部 MCP server (Food-Time), 把它的饮食工具并入 tool-calling"""
+        try:
+            from mcp_integration.client import create_food_time_client
+            from llm.tools import TOOLS
+            client = create_food_time_client()
+            tool_defs = await client.connect()
+            if tool_defs:
+                self.mcp_clients["food_time"] = client
+                TOOLS.extend(tool_defs)
+                logger.info(f"[MCP-client] Food-Time {len(tool_defs)} 个工具已并入 tool-calling")
+            else:
+                await client.close()
+        except Exception as e:
+            logger.warning(f"[MCP-client] 连接 Food-Time 失败: {e}")
 
     async def _adapter_loop(self, name: str, adp):
         """单个 adapter 的连接 + 自动重连循环"""
@@ -842,6 +862,11 @@ class QQBot:
             await self.memory_store.close()
         except Exception:
             pass
+        for _name, _client in self.mcp_clients.items():
+            try:
+                await _client.close()
+            except Exception:
+                pass
 
     async def _start_background_tasks(self):
         if self.config.get("proactive", {}).get("enabled"):
