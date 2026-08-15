@@ -7,7 +7,7 @@ import json
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 # 测试专用: 隔离 chat_memory 读写
 TEST_DIR = os.path.dirname(__file__)

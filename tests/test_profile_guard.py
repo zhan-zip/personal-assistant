@@ -2,7 +2,7 @@
 PROFILE_GUARD 单元测试: 验证 _is_explicit_profile_request
 """
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from profile import ProfileManager
 

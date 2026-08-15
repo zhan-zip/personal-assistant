@@ -4,7 +4,6 @@ QQ AI 机器人主类
 - 编排各模块 (LLM / Vision / Profile / Commands / Proactive / QZone / Event)
 """
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -13,10 +12,10 @@ from typing import Dict, List, Optional, Any
 
 import aiohttp
 import yaml
-import websockets
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from protocols.onebot import OneBotAdapter
 from qzone.qzone_browser import QZoneBrowser, _extract_f_info_text
 from core.commands import CommandHandler
 from proactive.proactive import ProactiveManager
@@ -49,10 +48,6 @@ CHAT_MEMORY_FILE = "chat_memory.json"
 PROACTIVE_FILE = "proactive_friends.json"
 PROFILE_STATE_FILE = "profile_state.json"
 
-# 发送节流: 同一用户连续发消息至少间隔 N 秒, 否则丢弃
-SEND_THROTTLE_SECONDS = 1.5
-
-
 class QQBot:
     """机器人主类, 仅做状态管理 + WS 编排"""
 
@@ -79,7 +74,6 @@ class QQBot:
             )
 
         # 运行状态
-        self.websocket = None
         self.running = False
         self._http_session: Optional[aiohttp.ClientSession] = None
         self._bg_tasks: List[asyncio.Task] = []  # 后台任务引用, 重连时取消
@@ -90,12 +84,15 @@ class QQBot:
         self.persona_cache: Optional[str] = None
         self.persona_mtime: float = 0.0
 
-        # WS 请求映射
-        self.pending_futures: Dict[int, asyncio.Future] = {}
-        self.message_id_counter: int = 0
-
-        # 发送节流 (user_id, content_hash) → 最后发送时间
-        self._last_send_time: Dict[tuple, float] = {}
+        # 协议适配器（当前: OneBot / NapCat）—— 协议细节收口在此
+        ncfg = self.config.get("napcat", {})
+        self.adapter = OneBotAdapter(
+            self,
+            ws_url=ncfg.get("ws_url", "ws://localhost:3001"),
+            access_token=ncfg.get("access_token", ""),
+            timeout=ncfg.get("timeout", 30),
+        )
+        self._retry_count = 0
 
         # 撤回相关
         self.message_id_buffer: Dict[int, str] = {}
@@ -342,60 +339,18 @@ class QQBot:
                 )
         self._save_profile_state()
 
-    # ==================== WebSocket 工具 ====================
-
-    def _next_message_id(self) -> int:
-        self.message_id_counter += 1
-        return self.message_id_counter
+    # ==================== 协议能力代理 ====================
+    # 所有协议相关操作统一转发给 adapter，核心模块无需感知底层协议
 
     async def _send_ws_request(self, action: str, params: Optional[Dict] = None,
                                timeout: float = 30) -> Any:
-        if not self.websocket:
-            logger.error("WebSocket未连接")
-            return None
-        msg_id = self._next_message_id()
-        request = {"action": action, "params": params or {}, "echo": msg_id}
-        future = asyncio.get_event_loop().create_future()
-        self.pending_futures[msg_id] = future
-        try:
-            await self.websocket.send(json.dumps(request, ensure_ascii=False))
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
-            logger.error(f"WebSocket请求超时 ({action})")
-            return None
-        except Exception as e:
-            logger.error(f"WebSocket请求失败: {e}")
-            return None
-        finally:
-            self.pending_futures.pop(msg_id, None)
-
-    # ==================== 发送消息 ====================
+        return await self.adapter.api_call(action, params, timeout)
 
     async def _send_private_msg(self, user_id: int, message: str) -> Optional[int]:
-        now = time.time()
-        content_hash = hashlib.md5(message.encode()).hexdigest()[:8]
-        key = (user_id, content_hash)
-        last = self._last_send_time.get(key, 0)
-        if now - last < SEND_THROTTLE_SECONDS:
-            logger.warning(
-                f"[SEND_BLOCK] 阻止重复发送 user={user_id} "
-                f"hash={content_hash} gap={now - last:.2f}s msg={message[:40]}"
-            )
-            return None
-        self._last_send_time[key] = now
-        logger.info(f"[SEND] user={user_id} hash={content_hash} msg={message[:40]}")
-
-        data = await self._send_ws_request(
-            "send_private_msg", {"user_id": user_id, "message": message}
-        )
-        if data and isinstance(data, dict):
-            return data.get("message_id")
-        return None
+        return await self.adapter.send_private(user_id, message)
 
     async def _send_group_msg(self, group_id: int, message: str):
-        await self._send_ws_request(
-            "send_group_msg", {"group_id": group_id, "message": message}
-        )
+        return await self.adapter.send_group(group_id, message)
 
     # ==================== LLM / 服务封装 ====================
 
@@ -713,81 +668,65 @@ class QQBot:
     # ==================== 主循环 ====================
 
     def _reset_connection_state(self):
-        """每次新连接前重置 WS 依赖的临时状态"""
+        """每次新连接前重置依赖旧连接的核心临时状态"""
         # 取消所有旧的后台任务
         for task in self._bg_tasks:
             if not task.done():
                 task.cancel()
         self._bg_tasks.clear()
 
-        self.pending_futures.clear()
         self.message_id_buffer.clear()
         self.message_recv_time.clear()
         self._verified_recall_ids.clear()
-        self._last_send_time.clear()
 
     async def run(self):
-        ws_url = self.config["napcat"]["ws_url"]
-        retry_count = 0
+        """主循环: 连接 NapCat, 断线自动重连"""
         max_backoff = 60  # 最大重试间隔（秒）
 
         while True:
             try:
                 self._reset_connection_state()
-                label = (f"重连 NapCat (第{retry_count}次): {ws_url}"
-                         if retry_count else f"连接 NapCat: {ws_url}")
+                self.adapter.reset_state()
+                label = (f"重连 NapCat (第{self._retry_count}次): {self.adapter.ws_url}"
+                         if self._retry_count else f"连接 NapCat: {self.adapter.ws_url}")
                 logger.info(label)
 
-                async with websockets.connect(ws_url) as ws:
-                    self.websocket = ws
-                    self.running = True
-                    retry_count = 0  # 连接成功, 重置重试计数
-                    logger.info("NapCat 连接成功")
-                    await self._init_profile_cache()
-                    # 后台生成进度消息池 (不阻塞主流程)
-                    asyncio.create_task(self.progress.init_pool())
-                    await self._start_background_tasks()
-                    await self._listen(ws)
+                await self.adapter.connect(
+                    on_event=self._on_adapter_event,
+                    on_ready=self._on_adapter_ready,
+                )
             except Exception as e:
                 logger.error(f"WebSocket 连接断开: {e}")
             finally:
                 self.running = False
-                self.websocket = None
 
-            retry_count += 1
-            delay = min(max_backoff, 2 ** retry_count)
+            self._retry_count += 1
+            delay = min(max_backoff, 2 ** self._retry_count)
             logger.info(f"{delay} 秒后自动重连...")
             await asyncio.sleep(delay)
 
-    async def _listen(self, ws):
-        """监听 WS 消息循环"""
-        async for message in ws:
-            try:
-                event = json.loads(message)
-                echo = event.get("echo")
-                if echo and echo in self.pending_futures:
-                    future = self.pending_futures[echo]
-                    if not future.done():
-                        status = event.get("status")
-                        if status == "ok":
-                            future.set_result(event.get("data"))
-                        else:
-                            future.set_result(event)
-                else:
-                    pt = event.get("post_type", "?")
-                    mid = event.get("message_id", "?")
-                    logger.info(
-                        f"[WS] post_type={pt} message_id={mid} echo={echo}"
-                    )
-                    asyncio.create_task(self.event_handler.handle_event(event))
-            except json.JSONDecodeError:
-                logger.warning(f"无法解析的消息: {message[:200]}")
-            except Exception as e:
-                logger.error(f"事件处理异常: {e}")
+    async def _on_adapter_ready(self):
+        """连接建立后、开始监听前，初始化核心状态"""
+        self.running = True
+        self._retry_count = 0
+        logger.info("NapCat 连接成功")
+        await self._init_profile_cache()
+        # 后台生成进度消息池 (不阻塞主流程)
+        asyncio.create_task(self.progress.init_pool())
+        await self._start_background_tasks()
+
+    async def _on_adapter_event(self, event: Dict):
+        """Adapter 收到原始事件时回调，交给事件处理器"""
+        asyncio.create_task(self.event_handler.handle_event(event))
 
     async def _shutdown(self):
-        """最终清理: 关闭浏览器 / HTTP 会话"""
+        """最终清理: 关闭适配器 / 浏览器 / HTTP 会话"""
         self.running = False
+        if getattr(self, "adapter", None):
+            try:
+                await self.adapter.close()
+            except Exception:
+                pass
         if self.qzone_browser:
             try:
                 await self.qzone_browser.close()
