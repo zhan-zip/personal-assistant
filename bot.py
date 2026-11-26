@@ -113,8 +113,8 @@ class QQBot:
         self._retry_count = 0
         self._bg_started = False
 
-        # 外部 MCP 客户端 (如 Food-Time 饮食工具), 启动时连接并入 tool-calling
-        self.mcp_clients: Dict[str, Any] = {}
+        # 外部 MCP 客户端管理器 (配置驱动: mcp_integration/configs/*.yaml), 启动时连接并入 tool-calling
+        self.mcp_manager = None
 
         # 向量记忆 (RAG 语义检索, ChromaDB), 启动时构建, 失败降级为纯关键词检索
         self.vector_store: Optional[Any] = None
@@ -802,7 +802,7 @@ class QQBot:
         """主循环: 并发连接所有 adapter, 各自断线自动重连"""
         await self._init_memory()   # 从 SQLite 载入记忆 / 迁移旧 JSON
         await self._init_vector_store()   # 语义记忆向量库 (失败自动降级关键词检索)
-        await self._init_mcp_clients()   # 连接外部 MCP server (如 Food-Time)
+        await self._init_mcp_clients()   # 连接外部 MCP server (configs/*.yaml 配置驱动)
         tasks = [
             asyncio.create_task(self._adapter_loop(name, adp))
             for name, adp in self.adapters.items()
@@ -810,16 +810,15 @@ class QQBot:
         await asyncio.gather(*tasks)
 
     async def _init_mcp_clients(self):
-        """连接外部 MCP server (Food-Time), 把它的饮食工具并入 tool-calling"""
+        """连接外部 MCP server (配置驱动, 见 mcp_integration/configs/*.yaml),
+        工具带前缀命名空间并入 tool-calling (如 food.search_foods)"""
         try:
-            from mcp_integration.client import create_food_time_client
+            from mcp_integration.client_manager import MCPClientManager
             from llm.tools import TOOLS
-            client = create_food_time_client(
-                server_dir=self.config.get("mcp", {}).get("food_time_server_dir") or None
-            )
-            tool_defs = await client.connect()
-            if tool_defs:
-                self.mcp_clients["food_time"] = client
+            manager = MCPClientManager()
+            tool_defs = await manager.load_all()
+            if manager.clients:
+                self.mcp_manager = manager
                 # 幂等并入: 已有同名工具不重复追加 (避免重复调用/热重启导致工具累积)
                 existing_names = {
                     t["function"]["name"] for t in TOOLS
@@ -832,13 +831,13 @@ class QQBot:
                 if new_defs:
                     TOOLS.extend(new_defs)
                 logger.info(
-                    f"[MCP-client] Food-Time {len(tool_defs)} 个工具已并入 tool-calling"
-                    f" (新增 {len(new_defs)})"
+                    f"[MCP-client] {len(manager.clients)} 个 MCP server 已连接, "
+                    f"{len(tool_defs)} 个工具已并入 tool-calling (新增 {len(new_defs)})"
                 )
             else:
-                await client.close()
+                logger.info("[MCP-client] 无已启用的 MCP server (configs 目录为空或全部 disabled)")
         except Exception as e:
-            logger.warning(f"[MCP-client] 连接 Food-Time 失败: {e}")
+            logger.warning(f"[MCP-client] MCP 初始化失败: {e}")
 
     async def _adapter_loop(self, name: str, adp):
         """单个 adapter 的连接 + 自动重连循环"""
@@ -906,9 +905,9 @@ class QQBot:
             await self.memory_store.close()
         except Exception:
             pass
-        for _name, _client in self.mcp_clients.items():
+        if self.mcp_manager:
             try:
-                await _client.close()
+                await self.mcp_manager.close_all()
             except Exception:
                 pass
 

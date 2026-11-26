@@ -843,12 +843,10 @@ async def execute_tool(bot: "QQBot", tool_name: str,
         elif tool_name in ("create_todo", "list_todos", "update_todo"):
             return await _exec_todo_tool(bot, tool_name, arguments, user_id)
 
-        # MCP 外部工具 (如 Food-Time 饮食工具), 由 bot 启动时动态并入
-        mcp_clients = getattr(bot, "mcp_clients", None)
-        if mcp_clients:
-            for _name, _client in mcp_clients.items():
-                if tool_name in _client.tool_names:
-                    return await _client.call(tool_name, arguments)
+        # MCP 外部工具 (前缀命名空间, 如 food.search_foods), 由 client_manager 按前缀路由
+        manager = getattr(bot, "mcp_manager", None)
+        if manager and tool_name in manager.tool_index:
+            return await manager.call_tool(tool_name, arguments)
 
         return f"[错误] 未知工具: {tool_name}"
 

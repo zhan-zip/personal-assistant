@@ -1,5 +1,9 @@
 """端到端流程测试: 模拟 NapCat 推送的消息事件, 验证全链路不崩
 
+⚠️ 已过期 (2026-11-26 确认): 本测试写于协议层分离之前, 依赖旧接口
+(b.websocket / handle_event 直收 OneBot event / chat_memory 未初始化),
+Phase 1 适配器架构落地后即失效, 且从未纳入回归清单 (历次"全部测试 N 项"不含本文件)。
+修复需按新架构重写 (adapter.parse_event → handle_message + memory_store mock), 待办。
 每个测试用例使用独立 user_id, 避免与真实数据污染
 """
 import asyncio

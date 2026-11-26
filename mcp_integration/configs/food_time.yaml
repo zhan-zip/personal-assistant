@@ -1,0 +1,13 @@
+# Food-Time 饮食记录 MCP server
+# 添加新 MCP server: 复制本文件改名, 改 name/tool_prefix/connection 三处即可, 零代码
+name: food_time
+display_name: "饮食记录 (Food-Time)"
+enabled: true
+connection:
+  type: stdio
+  command: python                  # "python" = qq-agent 当前解释器; 也可写绝对路径
+  args: ["-m", "src.mcp_integration.server"]
+  cwd: "${FOOD_TIME_SERVER_DIR}"   # 支持 ${VAR} 展开; 未设时回退 client.py 默认路径
+  env: {}                          # 可选: 注入子进程的环境变量
+tool_prefix: "food"                # 工具命名空间: food.search_foods
+auto_connect: true                 # 启动时自动连接
