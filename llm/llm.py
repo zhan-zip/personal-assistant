@@ -185,9 +185,23 @@ class LLMClient:
             if raw.startswith("```"):
                 raw = re.sub(r'^```\w*\n?', '', raw)
                 raw = re.sub(r'\n?```$', '', raw)
-            return json.loads(raw)
-        except (json.JSONDecodeError, Exception) as e:
+            # 1. 整体是合法 JSON
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                pass
+            # 2. 多行 JSON（LLM 每行输出一个独立 JSON，如进度消息池）
+            for line in raw.splitlines():
+                line = line.strip()
+                if line.startswith("[") or line.startswith("{"):
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+            return None
+        except Exception as e:
             logger.warning(f"_chat_json 解析失败: {e}, raw={raw[:200]}")
+            return None
 
     # ── 向量化 (RAG 语义记忆) ────────────────────
     async def embed_texts(self, texts: List[str]) -> Optional[List[List[float]]]:
