@@ -52,7 +52,12 @@ def _expand(value: str) -> str:
 
 
 class StdioMCPClient:
-    """按配置连接一个 stdio MCP server 的通用客户端"""
+    """按配置连接一个 stdio MCP server 的通用客户端
+
+    生命周期由守护任务持有 (async with 进出在同一 task 内),
+    关闭时通过 stop 事件让它在原任务自然退出——避免手动
+    __aenter__/__aexit__ 跨任务触发 anyio cancel scope 报错。
+    """
 
     def __init__(self, name: str, connection: Dict[str, Any],
                  tool_prefix: str, display_name: str = ""):
@@ -61,10 +66,27 @@ class StdioMCPClient:
         self.connection = connection
         self.tool_prefix = tool_prefix
         self.session: Optional[ClientSession] = None
-        self._ctx = None
         self.tool_names: set = set()                 # 该 server 的原始工具名
         self.prefixed_names: set = set()             # 带前缀的工具名 (路由用)
         self.tool_defs: List[Dict[str, Any]] = []    # OpenAI schema (带前缀)
+        self._task: Optional[asyncio.Task] = None
+        self._stop: Optional[asyncio.Event] = None
+        self._ready: Optional[asyncio.Event] = None
+
+    async def _run(self, params: StdioServerParameters,
+                   ready: asyncio.Event, stop: asyncio.Event):
+        """持有连接完整生命周期: 建立会话 -> 等关闭信号 -> 原任务内清理"""
+        try:
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    self.session = session
+                    ready.set()
+                    await stop.wait()
+                    self.session = None
+        finally:
+            self.session = None
+            ready.set()   # 启动失败/异常时也放行 connect 的等待
 
     async def connect(self) -> List[Dict[str, Any]]:
         """启动 MCP server 子进程并拉取工具定义 (工具名加前缀)"""
@@ -79,11 +101,21 @@ class StdioMCPClient:
         params = StdioServerParameters(
             command=command, args=args, cwd=cwd or None, env=env
         )
-        self._ctx = stdio_client(params)
-        read, write = await self._ctx.__aenter__()
-        self.session = ClientSession(read, write)
-        await self.session.__aenter__()
-        await self.session.initialize()
+        self._stop = asyncio.Event()
+        self._ready = asyncio.Event()
+        self._task = asyncio.create_task(
+            self._run(params, self._ready, self._stop), name=f"mcp-{self.name}"
+        )
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            await self._cancel()
+            raise RuntimeError(f"MCP server {self.name} 启动超时 (30s)")
+        if self.session is None:
+            # _run 已退出 (启动失败): 取回 task 异常作为真实原因
+            if self._task.done() and self._task.exception() is not None:
+                raise self._task.exception()
+            raise RuntimeError(f"MCP server {self.name} 启动失败")
 
         tools = await self.session.list_tools()
         for t in tools.tools:
@@ -107,20 +139,34 @@ class StdioMCPClient:
 
     async def call(self, name: str, arguments: Dict[str, Any]) -> str:
         """调用该 server 的一个工具 (原始名), 返回文本结果"""
+        if self.session is None:
+            return f"[错误] MCP server 不在线: {self.name}"
         result = await self.session.call_tool(name, arguments or {})
         parts = [c.text for c in result.content if hasattr(c, "text")]
         return "\n".join(parts) if parts else str(result)
 
-    async def close(self):
-        try:
-            if self.session:
-                await self.session.__aexit__(None, None, None)
-            if self._ctx:
-                await self._ctx.__aexit__(None, None, None)
-        except Exception as e:
-            logger.warning(f"[MCP-client] {self.name} 关闭失败: {e}")
+    async def _cancel(self):
+        """关闭/兜底: 通知守护任务退出 (cancel 点在 stop.wait(), 同 task 合法)"""
+        if self._stop is not None:
+            self._stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=10)
+            except asyncio.TimeoutError:
+                self._task.cancel()
+                try:
+                    await self._task
+                except Exception:
+                    pass
+            except Exception:
+                pass   # task 内异常已在 connect 阶段暴露过, 关闭期不再上抛
+        self._task = None
+        self._stop = None
+        self._ready = None
         self.session = None
-        self._ctx = None
+
+    async def close(self):
+        await self._cancel()
 
 
 class MCPClientManager:

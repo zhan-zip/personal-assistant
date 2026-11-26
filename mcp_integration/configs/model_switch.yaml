@@ -1,0 +1,15 @@
+# model-switch-optimize MCP server (多模型降级自修复管理系统)
+# 添加新 MCP server: 复制本文件改名, 改 name/tool_prefix/connection 三处即可, 零代码
+name: model_switch
+display_name: "模型切换与容灾 (model-switch-optimize)"
+enabled: true
+connection:
+  type: stdio
+  # 用它自己环境的 python (3.14 + mcp 1.30, mcp.py 要求 mcp<2.0);
+  # qq-agent 环境是 mcp 2.0.0, stdio 子进程协议互通, 版本无需一致
+  command: "E:/Scoop/apps/python/current/Scripts/mso.exe"
+  args: ["mcp"]
+  cwd: "D:/Desktop/软著/new-model-switch-optimize"   # 它的 config/ 与 data/ 相对路径都基于项目根
+  env: {}
+tool_prefix: "mso"                 # 工具命名空间: mso.choose_model / mso.model_health
+auto_connect: true
