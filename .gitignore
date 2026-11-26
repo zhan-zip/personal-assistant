@@ -48,3 +48,4 @@ Thumbs.db
 
 # ── 测试工具临时文件 ──
 .playwright-mcp/
+docs/
